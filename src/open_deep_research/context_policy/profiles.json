@@ -1,0 +1,46 @@
+{
+  "policy_version": "context-v1",
+  "roles": {
+    "supervisor": {
+      "rules": ["supervisor.md"],
+      "capabilities": ["research_dispatch", "self_reflection"],
+      "budget_key": "supervisor_context_budget"
+    },
+    "researcher": {
+      "rules": ["researcher.md"],
+      "capabilities": ["web_search", "repo_read", "paper_search", "mcp_read", "self_reflection"],
+      "budget_key": "researcher_context_budget"
+    },
+    "reviewer": {
+      "rules": ["reviewer.md"],
+      "capabilities": [],
+      "budget_key": "reviewer_context_budget"
+    },
+    "writer": {
+      "rules": ["writer.md"],
+      "capabilities": [],
+      "budget_key": "writer_context_budget"
+    },
+    "extractor": {
+      "rules": ["extractor.md"],
+      "capabilities": [],
+      "budget_key": "extractor_context_budget"
+    },
+    "compressor": {
+      "rules": ["compressor.md"],
+      "capabilities": [],
+      "budget_key": "compressor_context_budget"
+    },
+    "brief_writer": {
+      "rules": ["brief_writer.md"],
+      "capabilities": [],
+      "budget_key": "brief_context_budget"
+    }
+  },
+  "tool_guides": {
+    "web_search": ["web_search.md"],
+    "repo_read": ["repository_read.md"],
+    "paper_search": ["paper_search.md"],
+    "mcp_read": ["mcp_read.md"]
+  }
+}

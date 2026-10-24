@@ -1,0 +1,112 @@
+{
+  "cwd": "~/open_deep_research",
+  "git_present": false,
+  "files": [
+    {
+      "path": ".gitignore",
+      "sha256": "e3c2ef2cb33718996f94b4363fdc4941a4623ad39653009e9b4226fc2dbfe27d"
+    },
+    {
+      "path": "langgraph.json",
+      "sha256": "3696f8a4c5f5473368fff624954670c89ca0a1de8a94523c2dce4f761fcf8aca"
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "57454bd01a58641b931f6879aa13030e798cfcdffe06c46ea22d606d4b667f6a"
+    },
+    {
+      "path": "src/legacy/__init__.py",
+      "sha256": "d2db13cd8b49fa04f444f9510ff41ba6d93af9035d6929d312a607eed548db4c"
+    },
+    {
+      "path": "src/legacy/configuration.py",
+      "sha256": "8e9eb6d140746857e24923f4211d01e0ac5df5f9d461774e99b1dbc64699395c"
+    },
+    {
+      "path": "src/legacy/graph.py",
+      "sha256": "3cca7e2463010a254690f749bd9e98bfd7b76a732dd93406775dec6321917877"
+    },
+    {
+      "path": "src/legacy/multi_agent.py",
+      "sha256": "84a72b85f2c7e74b691fbc81362f9f840b08b9ec4908b6e66bcf7c95c262e9f0"
+    },
+    {
+      "path": "src/legacy/prompts.py",
+      "sha256": "9f099ed5ea78738f739dc489126222b067e4957b15853d17abb50b2f5e231045"
+    },
+    {
+      "path": "src/legacy/state.py",
+      "sha256": "503ace0fbf7f5cda5d3e4c5521406271653743340ea07295307c5bf3845f0019"
+    },
+    {
+      "path": "src/legacy/tests/conftest.py",
+      "sha256": "67fa55b8493fc80f63a6d366fb06ae49abb4c60f838f708b9b8ccd6872c2956a"
+    },
+    {
+      "path": "src/legacy/tests/run_test.py",
+      "sha256": "22f0901f2dbedb45d79ca4e6a131047d234cf2a09e1cb98884135399b476ae99"
+    },
+    {
+      "path": "src/legacy/tests/test_report_quality.py",
+      "sha256": "44e9c20e2dcd093633578db87fef017c8974ceb9971a490919df35a5ad8a6634"
+    },
+    {
+      "path": "src/legacy/utils.py",
+      "sha256": "297df67dffe90fb483cf0149fc5884a023530b8a0d61492818e216e8ad78f20f"
+    },
+    {
+      "path": "src/open_deep_research/configuration.py",
+      "sha256": "61e1a62ada20d16cb7b876c10b15a3ddb71f61248a53a05d7511ca6930af98da"
+    },
+    {
+      "path": "src/open_deep_research/deep_researcher.py",
+      "sha256": "af128d5d8773008d021b6ef7562e9fb90a45f7eb5e886483d1e6e835223275e0"
+    },
+    {
+      "path": "src/open_deep_research/prompts.py",
+      "sha256": "239774f8444860deab0ac0d86067002ef360068ad4c1f0b698373335e6b59579"
+    },
+    {
+      "path": "src/open_deep_research/state.py",
+      "sha256": "7a03f4a1d5132573ed306d403fd3478fe8916d955f3caa44a8d365877ac35d0e"
+    },
+    {
+      "path": "src/open_deep_research/utils.py",
+      "sha256": "1536ea25de5210d7b37f8c81ade3348a000f43a814d4e853e1e12b3ae1de0812"
+    },
+    {
+      "path": "src/security/auth.py",
+      "sha256": "0ab832d32c9596e97faa78565b98b63229d7a46e59a8504ae340b6b49c9c979e"
+    },
+    {
+      "path": "tests/evaluators.py",
+      "sha256": "0189a2f1740b0a310c740ae5a7e527d47bdc84c49f12fbe40bd4635552b3ea2e"
+    },
+    {
+      "path": "tests/extract_langsmith_data.py",
+      "sha256": "c9ebbece50888469af21b700921500ead9525fb9c39016cc2303bd345622b5d3"
+    },
+    {
+      "path": "tests/pairwise_evaluation.py",
+      "sha256": "d66a157a6a84ed9d55cb8a8234ede908707f652ec2c10943a9fe26891f3eabe2"
+    },
+    {
+      "path": "tests/prompts.py",
+      "sha256": "7083f43e37aa906c07aee8709c921381a8bfbdfe49892119b8d290a9ddbaf69d"
+    },
+    {
+      "path": "tests/run_evaluate.py",
+      "sha256": "23abd8f026985fbab4ccac78cc95d24c7e5730e568f5904634a40d64e8843d62"
+    },
+    {
+      "path": "tests/supervisor_parallel_evaluation.py",
+      "sha256": "1b74c65aaa5aaf6ea7fd1c63be7ebf7425a04d5e437de7c1caf48c06c1b48fad"
+    },
+    {
+      "path": "uv.lock",
+      "sha256": "bacf306f2a4a4198d77b2b2a6169a7ab2d827525b181fe67e1f7f414ab833557"
+    }
+  ],
+  "captured_on": "2026-10-23",
+  "purpose": "Design-only source snapshot; no implementation or benchmark executed."
+}

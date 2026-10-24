@@ -1,0 +1,8 @@
+Synthesize the user's messages into one concrete research brief. Keep the user's constraints verbatim: language, dates, regions, versions, formats, exclusions. Do not invent details the user did not give; declare them open-ended. Prefer primary sources over aggregators, and write from the user's perspective.
+
+User messages:
+<Messages>
+{messages}
+</Messages>
+
+Today's date is {date}.

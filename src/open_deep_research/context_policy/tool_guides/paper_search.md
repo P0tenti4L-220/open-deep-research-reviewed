@@ -1,0 +1,1 @@
+Paper search returns titles, abstracts and identifiers. Prefer the version of record and note the venue and year; a preprint's claims are not peer-reviewed findings. Distinguish the paper's stated result from interpretations written in its abstract.

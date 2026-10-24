@@ -1,0 +1,1 @@
+A repository/documentation reader returns file paths and code or prose. Cite `path:line` when the tool provides it. Distinguish the behaviour of the pinned version from later or unreleased behaviour, and do not infer runtime behaviour from marketing text when source code is available.
