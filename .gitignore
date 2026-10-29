@@ -16,6 +16,14 @@
 !/src/open_deep_research/
 !/src/legacy/
 !/src/security/
+/src/open_deep_research/*
+!/src/open_deep_research/*.py
+!/src/open_deep_research/default_pricing.json
+!/src/open_deep_research/context_policy/
+/src/legacy/*
+!/src/legacy/*.py
+/src/security/*
+!/src/security/*.py
 /docs/*
 !/docs/public/
 
