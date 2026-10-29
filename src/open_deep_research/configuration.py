@@ -6,7 +6,14 @@ from enum import Enum
 from typing import Any, List, Optional
 
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
+
+# Key under which the host stores the *resolved* Configuration (one snapshot per run).
+# A node that finds it must not re-resolve from the process environment: the run's
+# model, factors and limits are fixed at host start, so a later ``os.environ`` change
+# (dotenv, a test, a sibling run) cannot silently rewrite a run in flight.
+RESOLVED_CONFIG_KEY = "__odr_config__"
+_UNSET = object()
 
 
 class SearchAPI(Enum):
@@ -305,6 +312,10 @@ class Configuration(BaseModel):
             }
         },
     )
+    reviewer_once: bool = Field(
+        default=False,
+        description="Review the finished report once, optionally rewrite once, then return it. No research/review loop.",
+    )
     artifact_root: Optional[str] = Field(
         default=None,
         metadata={
@@ -350,11 +361,79 @@ class Configuration(BaseModel):
     max_review_events: int = Field(default=6)
     max_review_model_calls: int = Field(default=16)
     max_revision_rounds: int = Field(default=2)
+    # Bounded correction rounds per open revalidation event (a recovery loop must not
+    # be able to spend the whole run budget).
+    max_revalidation_rounds: int = Field(default=2)
     review_timeout_seconds: float = Field(default=180.0)
+    # Observability (see docs/context-review-design/observability-plan-2026-10-26).
+    # ``none`` disables the session entirely: no files, no callbacks, no network.
+    observability_backend: str = Field(
+        default="none",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "none",
+                "description": "Trace backend. none disables observation; local writes only the local record; langsmith additionally exports to the configured project. One backend at a time.",
+                "options": [
+                    {"label": "none", "value": "none"},
+                    {"label": "local record only", "value": "local"},
+                    {"label": "LangSmith", "value": "langsmith"},
+                    {"label": "Langfuse (not implemented yet)", "value": "langfuse"},
+                ],
+            }
+        },
+    )
+    observability_content_mode: str = Field(
+        default="metadata_only",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "metadata_only",
+                "description": "What may leave the process: metadata_only uploads identifiers, counts and hashes; redacted adds scrubbed short excerpts; synthetic_full is only for synthetic pilot material.",
+                "options": [
+                    {"label": "metadata only", "value": "metadata_only"},
+                    {"label": "redacted excerpts", "value": "redacted"},
+                    {"label": "synthetic full", "value": "synthetic_full"},
+                ],
+            }
+        },
+    )
+    observability_sample_rate: float = Field(default=1.0)
+    observability_export_deadline_seconds: float = Field(default=5.0)
+    observability_require_complete_trace: bool = Field(default=False)
     # Global run budget.
     max_total_model_calls: int = Field(default=120)
     max_total_tokens: int = Field(default=2_000_000)
+    max_total_search_queries: Optional[int] = Field(default=None, ge=0)
+    search_domains: List[str] = Field(default_factory=list)
+    page_fetch_domains: List[str] = Field(default_factory=list)
+    page_fetch_path_prefixes: List[str] = Field(default_factory=list)
+    page_fetch_priority_paths: List[str] = Field(default_factory=list)
+    max_total_page_fetches: int = Field(default=0, ge=0)
     budget_stop_policy: StopPolicy = Field(default=StopPolicy.REVIEW)
+    # Paid-run preconditions (see ``open_deep_research.preflight``). An amount cap is
+    # required before a paid run: it is converted to a worst-case token ceiling, which
+    # the per-request admission check then enforces.
+    max_cost_usd: Optional[float] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 0,
+                "description": "Hard amount cap in USD for this run's model usage. Required for a paid run; unknown prices are refused, never counted as zero.",
+            }
+        },
+    )
+    pricing_path: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Frozen price table for cost estimation. Empty means the repository table or ODR_PRICING_PATH.",
+            }
+        },
+    )
     # Context budgets (input soft caps, tokens).
     supervisor_context_budget: int = Field(default=6000)
     researcher_context_budget: int = Field(default=12000)
@@ -364,28 +443,58 @@ class Configuration(BaseModel):
     extractor_context_budget: int = Field(default=4000)
     brief_context_budget: int = Field(default=12000)
 
+    # Which fields the caller set explicitly (host/CLI/UI). The arm convenience switch
+    # must not overwrite a factor the caller chose on purpose.
+    _explicit_fields: set = PrivateAttr(default_factory=set)
+    _arm_applied: bool = PrivateAttr(default=False)
 
     @classmethod
     def from_runnable_config(
         cls, config: Optional[RunnableConfig] = None
     ) -> "Configuration":
-        """Create a Configuration instance from a RunnableConfig."""
+        """Resolve the run configuration once: explicit > environment snapshot > default.
+
+        Explicit values in ``configurable`` win over the process environment (the
+        previous order let an inherited ``CONTEXT_POLICY``/``RESEARCH_MODEL`` rewrite a
+        run whose host had already chosen otherwise). A resolved snapshot from the host
+        short-circuits everything: nodes read the same configuration the host bound.
+        """
         configurable = config.get("configurable", {}) if config else {}
-        field_names = list(cls.model_fields.keys())
+        snapshot = configurable.get(RESOLVED_CONFIG_KEY)
+        if isinstance(snapshot, cls):
+            return snapshot.model_copy()
         values: dict[str, Any] = {}
-        for field_name in field_names:
-            value = os.environ.get(field_name.upper(), configurable.get(field_name))
+        explicit: set = set()
+        for field_name in cls.model_fields:
+            value = configurable.get(field_name, _UNSET)
             # An explicit empty value (unset .env entry, cleared UI field) means "not
             # set"; it must not be coerced to "" and then to 0/False by pydantic.
-            if isinstance(value, str) and not value.strip():
-                value = None
-            values[field_name] = value
-        return cls(**{k: v for k, v in values.items() if v is not None})
+            if value is not _UNSET and not (isinstance(value, str) and not value.strip()):
+                values[field_name] = value
+                explicit.add(field_name)
+                continue
+            env_value = os.environ.get(field_name.upper())
+            if env_value is not None and not (isinstance(env_value, str) and not env_value.strip()):
+                values[field_name] = env_value
+        resolved = cls(**values)
+        resolved._explicit_fields = explicit
+        return resolved.apply_experiment_arm()
 
     def apply_experiment_arm(self) -> "Configuration":
-        """Resolve the explicit ``experiment_arm`` (A/B/C/D) over the two factors."""
-        arm = os.environ.get("EXPERIMENT_ARM") or getattr(self, "experiment_arm", None)
+        """Resolve the explicit ``experiment_arm`` (A/B/C/D) over the two factors.
+
+        The arm is applied exactly once, at resolution time. A factor the caller set
+        explicitly (``context_policy=baseline``, ``reviewer_enabled=False``) is never
+        rewritten by the arm or by ``EXPERIMENT_ARM``, and a later environment change
+        cannot re-arm a run in flight.
+        """
+        if self._arm_applied:
+            return self
+        arm = getattr(self, "experiment_arm", None) or os.environ.get("EXPERIMENT_ARM")
         if not arm:
+            # Remembered as resolved: a later EXPERIMENT_ARM in the environment must not
+            # re-arm a run that already started without one.
+            self._arm_applied = True
             return self
         arm = str(getattr(arm, "value", arm)).upper()
         mapping = {
@@ -397,7 +506,18 @@ class Configuration(BaseModel):
         if arm not in mapping:
             raise ValueError(f"Unknown experiment_arm {arm!r}; expected A, B, C or D")
         policy, reviewer = mapping[arm]
-        return self.model_copy(update={"context_policy": policy, "reviewer_enabled": reviewer})
+        update: dict[str, Any] = {}
+        if "context_policy" not in self._explicit_fields:
+            update["context_policy"] = policy
+        if "reviewer_enabled" not in self._explicit_fields:
+            update["reviewer_enabled"] = reviewer
+        if not update:
+            result = self
+        else:
+            result = self.model_copy(update=update)
+            result._explicit_fields = set(self._explicit_fields)
+        result._arm_applied = True
+        return result
 
     class Config:
         """Pydantic configuration."""

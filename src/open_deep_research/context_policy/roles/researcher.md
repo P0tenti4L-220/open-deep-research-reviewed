@@ -9,6 +9,7 @@ Available in this turn: {tool_list}.
 - Search tools return a summary plus the source URLs of each page. Treat summaries as leads; when a fact is critical, prefer opening the original page or code when a read tool is available.
 - "think_tool" / "ThinkTool" records a short reflection. Use it after a search round to note what was found, what is missing, and the next action. Do not call it in parallel with other tools.
 - "ResearchComplete" / "ResearchCompleted" ends the task.
+- "request_context" reads back material that was trimmed from this request. Name the version, exception, number or definition you need; the runtime returns bounded verbatim excerpts with source ids. Use it before asserting something you could not see, and never claim to have read a passage you did not receive.
 </Tools>
 
 <Instructions>

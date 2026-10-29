@@ -37,6 +37,51 @@ class Summary(BaseModel):
     summary: str
     key_excerpts: str
 
+
+class Fact(BaseModel):
+    """One atomic fact returned by the compressor, bound to one archived source.
+
+    The host does not trust these fields: ``evidence_id`` must name a source this
+    task may read, and ``quote`` must occur verbatim in the archived object. Only
+    then does the fact become a claim (still ``unchecked``: locatable is not the
+    same as semantically supported).
+    """
+
+    statement: str = Field(description="One complete, self-contained factual statement; no headings or citation labels.")
+    evidence_id: str = Field(description="The archived evidence id (E<n>) this statement comes from.")
+    quote: str = Field(description="A short verbatim excerpt of the archived source that states the fact.")
+    requirement_ids: List[str] = Field(default_factory=list, description="Brief requirement ids this fact addresses, if any.")
+
+
+class CompressedResearch(BaseModel):
+    """Structural output of the compression step: one summary plus atomic facts."""
+
+    summary: str = Field(description="Clean, complete findings; keep every relevant detail and do not invent facts.")
+    facts: List[Fact] = Field(default_factory=list, description="Atomic facts, each tied to one evidence id and a verbatim quote.")
+
+
+class ClaimRevision(BaseModel):
+    """One proposed change to an existing claim (validated and written by the host)."""
+
+    claim_id: str = Field(description="Existing active claim id to revise or withdraw.")
+    action: Literal["revise", "withdraw"] = Field(default="revise")
+    statement: str = Field(default="", description="Replacement statement; required for 'revise'.")
+    evidence_id: str = Field(default="", description="One archived evidence id that supports the replacement statement.")
+    quote: str = Field(default="", description="Verbatim excerpt of that archived source (<= 800 chars).")
+    requirement_ids: List[str] = Field(default_factory=list, description="Requirement ids the revised claim addresses; empty keeps the existing mapping.")
+    reason: str = Field(default="", description="Why the claim changes (reviewer finding, wrong mapping, withdrawn).")
+
+
+class ReviseClaims(BaseModel):
+    """Apply validated claim revisions after a review asked for corrections.
+
+    The host checks the claim id, evidence permission and verbatim quote; a rejected
+    revision is reported back and never written. Withdrawing keeps the original
+    record and its counter-evidence in the audit trail.
+    """
+
+    revisions: List[ClaimRevision] = Field(description="Claim revisions to apply.")
+
 class ClarifyWithUser(BaseModel):
     """Model for user clarification requests."""
     
@@ -148,6 +193,18 @@ class SupportStatus(str, Enum):
     NEEDS_REVALIDATION = "needs_revalidation"
 
 
+class ClaimStatus(str, Enum):
+    """Lifecycle of one claim record.
+
+    A withdrawn claim stays in the version history (and keeps its counter-evidence)
+    but no longer counts towards coverage, writing or a delivery check. A revision
+    writes a new version of the same claim id instead of editing the old file.
+    """
+
+    ACTIVE = "active"
+    WITHDRAWN = "withdrawn"
+
+
 ###################
 # Contracts
 ###################
@@ -249,6 +306,21 @@ class ClaimRecord(_Contract):
     qualifiers: List[str] = Field(default_factory=list)
     contradiction_refs: List[str] = Field(default_factory=list)
     version: int = 1
+    # --- claim lifecycle -------------------------------------------------
+    # ``active`` claims are the only ones writer / coverage / review may use;
+    # ``withdrawn`` claims remain readable in the audit history.
+    status: ClaimStatus = ClaimStatus.ACTIVE
+    supersedes_version: int = 0
+    revision_reason: str = ""
+    # The exact archived span a claim is bound to (content hash + offsets + quote).
+    # It is metadata for the Reviewer, not proof: support stays ``unchecked`` until
+    # a review says the statement is entailed.
+    support_span: Dict[str, Any] = Field(default_factory=dict)
+    # Set when the extraction named a reference the host could not resolve. Such a
+    # claim is kept as a visible gap; it is never silently re-pointed at another id.
+    unbound_reason: str = ""
+    unknown_refs: List[str] = Field(default_factory=list)
+    source_urls: List[str] = Field(default_factory=list)
 
 
 class ToolCallRecord(_Contract):
@@ -275,13 +347,28 @@ class UsageRecord(_Contract):
     request_id: str = ""
     attempt_id: str = ""
     reservation_id: str = ""
+    # Execution boundary: a re-run of the same business run has its own ledger rows,
+    # so first-delivery and cumulative spend can be told apart.
+    execution_id: str = ""
     agent_instance_id: str = ""
     role: str = ""
     model: str = ""
+    # What the provider reports as the served model, when it says so. The requested
+    # ``model`` and the served ``actual_model`` are both kept: a silent provider-side
+    # substitution must be visible instead of being assumed equal.
+    actual_model: str = ""
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     cached_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
+    # ``cost_usd`` is the recomputable estimate (usage x frozen price). Provider-billed
+    # and lower-bound totals are separate fields and are never mixed into it.
     cost_usd: Optional[float] = None
+    estimated_model_cost_usd: Optional[float] = None
+    provider_billed_cost_usd: Optional[float] = None
+    cost_method: str = "unknown"
+    price_snapshot_hash: str = ""
     latency_s: float = 0.0
     counting_method: str = "unknown"
 
@@ -306,18 +393,108 @@ class TaskResult(_Contract):
     error_class: str = ""
     version: int = 1
     raw_notes: Optional[str] = None
+    # Requirements whose conclusions this task produced before newly restored
+    # material arrived. Downstream must re-check them before delivery.
+    needs_revalidation: List[str] = Field(default_factory=list)
 
 
 class WorkingMemory(_Contract):
-    """Compact working state of one agent invocation (not the full history)."""
+    """Compact working state of one agent invocation (not the full history).
+
+    The runtime fills this *deterministically* from the event log (tool results,
+    errors, evidence ids and the task card). It is the only part of the earlier
+    conversation that is re-projected into the next researcher request, so a trimmed
+    history cannot silently drop what the task still needs.
+    """
 
     task_id: str = ""
+    objective_ref: str = ""
+    active_requirement_ids: List[str] = Field(default_factory=list)
+    covered_requirement_ids: List[str] = Field(default_factory=list)
     confirmed_claim_refs: List[str] = Field(default_factory=list)
     unknowns: List[str] = Field(default_factory=list)
     conflicts: List[str] = Field(default_factory=list)
     failed_approaches: List[str] = Field(default_factory=list)
     next_action: str = ""
     source_event_ids: List[str] = Field(default_factory=list)
+    recovery_refs: List[str] = Field(default_factory=list)
+    needs_revalidation: List[str] = Field(default_factory=list)
+    updated_at: str = ""
+
+
+class ContextPatch(_Contract):
+    """Result of one ``request_context`` recovery call.
+
+    ``status`` distinguishes "not found" from "not allowed" and "only a partial
+    match"; recovery never reports an empty answer as proof that the material does
+    not exist.
+    """
+
+    need: str = ""
+    purpose: str = ""
+    status: Literal["found", "partial", "unavailable", "access_denied"] = "unavailable"
+    restored_refs: List[str] = Field(default_factory=list)
+    exact_excerpts: List[Dict[str, Any]] = Field(default_factory=list)
+    source_versions: List[Dict[str, Any]] = Field(default_factory=list)
+    affected_requirement_ids: List[str] = Field(default_factory=list)
+    still_missing: List[str] = Field(default_factory=list)
+    denied_refs: List[str] = Field(default_factory=list)
+    queried_refs: int = 0
+    truncated: bool = False
+
+
+class RevalidationEvent(_Contract):
+    """One bounded correction event: recovered material that may invalidate a result.
+
+    The event is host-owned. It is opened by the runtime when a recovery patch names
+    requirements whose conclusions were produced before the new material existed, and
+    it is resolved only by a later research result that covers those requirements (or
+    by an explicit reviewer decision). Old review passes keep their own hash, so a
+    report approved earlier cannot silently stay approved after the correction.
+    """
+
+    event_id: str
+    trigger: str = "request_context"
+    reason: str = ""
+    task_id: str = ""
+    restored_refs: List[str] = Field(default_factory=list)
+    affected_claim_ids: List[str] = Field(default_factory=list)
+    affected_requirement_ids: List[str] = Field(default_factory=list)
+    status: Literal["open", "resolved", "dismissed"] = "open"
+    created_at: str = ""
+    resolved_at: str = ""
+    resolved_by: str = ""
+
+
+class RevalidationReceipt(_Contract):
+    """Independent proof that one correction event's claims were re-checked.
+
+    A recovery patch only proves that material was *read*. It does not prove that the
+    conclusion built before it arrived is still true. This receipt is issued by the
+    independent review boundary, binds the checked claims/evidence to their content
+    hashes and versions, and is the only artifact that can close an event.
+
+    A contradicted verdict still completes the check (the downstream claim must then be
+    revised or qualified); it is not a delivery success.
+    """
+
+    receipt_id: str
+    event_id: str
+    review_id: str
+    packet_hash: str
+    task_id: str
+    claim_ids: List[str] = Field(default_factory=list)
+    claim_hashes: Dict[str, str] = Field(default_factory=dict)
+    claim_versions: Dict[str, int] = Field(default_factory=dict)
+    requirement_ids: List[str] = Field(default_factory=list)
+    evidence_ids: List[str] = Field(default_factory=list)
+    evidence_hashes: Dict[str, str] = Field(default_factory=dict)
+    evidence_versions: Dict[str, int] = Field(default_factory=dict)
+    verdicts: Dict[str, str] = Field(default_factory=dict)
+    report_version: int = 0
+    checker_identity: str = ""
+    checker_kind: str = "independent_reviewer"
+    created_at: str = ""
 
 
 class EvictionRecord(_Contract):
@@ -355,10 +532,14 @@ class ReviewFinding(_Contract):
     """One actionable finding of the Reviewer."""
 
     requirement_id: str = ""
-    claim_id: str = ""
+    claim_id: str = Field(default="", description="Claim id (C-...) the finding is about; never an evidence id.")
+    segment_id: str = Field(default="", description="Shown S/P segment id, not a claim id.")
     issue_type: str = ""
     severity: Literal["blocking", "major", "minor"] = "major"
-    evidence_refs: List[str] = Field(default_factory=list)
+    evidence_refs: List[str] = Field(
+        default_factory=list,
+        description="Archived evidence ids only (E1, E2 ...). Put claim ids in claim_id, never here.",
+    )
     explanation: str = ""
     required_action: str = ""
 
@@ -402,6 +583,14 @@ class ReviewPacket(_Contract):
     # Which segments this request shows (empty = all). A long draft is reviewed in
     # contiguous batches, so every segment is eventually read.
     review_segments: List[str] = Field(default_factory=list)
+    # Evidence whose archived excerpt was cut to the per-item cap. The reviewer may
+    # read the full object through its allowed scope; a cut excerpt is *not* a
+    # missing source and must not be reported as one.
+    evidence_truncated_ids: List[str] = Field(default_factory=list)
+    # Open correction events (recovered material that may invalidate a result).
+    revalidation_issues: List[str] = Field(default_factory=list)
+    # Unclosed major/blocking findings, bound to the claim and source material.
+    prior_claim_findings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ReviewDecision(_Contract):
@@ -426,7 +615,30 @@ class ReviewDecision(_Contract):
     review_status: str = "inconclusive"
     review_cost: float = 0.0
     review_model_calls: int = 0
+    # S3: False when at least one required batch did not finish (timeout, parse
+    # failure, budget stop) or when no usable output exists. A decision that is not
+    # complete can never authorize a full delivery, whatever its verdict says.
+    review_complete: bool = True
+    # Format violations in the reviewer's own output (e.g. several ids in one field
+    # that are not all valid). They are protocol errors, not a research gap, and must
+    # not be turned into a new research round.
+    protocol_errors: List[str] = Field(default_factory=list)
+    finding_resolutions: Dict[str, str] = Field(default_factory=dict)
     error: str = ""
+
+
+class FindingResolution(_Contract):
+    """An explicit recheck of an existing finding, validated against this packet."""
+
+    finding_id: str
+    reason: str
+
+
+class SimpleReportReview(BaseModel):
+    """A single practical review, without the strict evidence-audit protocol."""
+
+    approved: bool
+    feedback: str
 
 
 class RawReviewOutput(BaseModel):
@@ -436,6 +648,7 @@ class RawReviewOutput(BaseModel):
         description="Overall verdict for the reviewed proposal, draft or completion request."
     )
     summary: str = Field(description="One or two sentences describing what was checked.")
+    finding_resolutions: List[FindingResolution] = Field(default_factory=list, description="Explicit rechecks using only finding_id values from PriorClaimFindings; return [] when that list is empty. Revalidation ids are not finding ids. Omit unresolved findings.")
     findings: List[ReviewFinding] = Field(
         default_factory=list,
         description="Actionable problems. Leave empty only if the verdict is 'pass'.",
@@ -479,6 +692,16 @@ def task_ledger_reducer(current_value, new_value):
     merged = dict(current_value or {})
     for task_id, entry in (new_value or {}).items():
         merged[task_id] = {**(merged.get(task_id) or {}), **entry}
+    return merged
+
+
+def repair_grant_reducer(current_value, new_value):
+    """Merge granted repair turns by review id (idempotent across a subgraph merge)."""
+    merged = dict(current_value or {})
+    if isinstance(new_value, dict) and new_value.get("type") == "override":
+        new_value = new_value.get("value") or {}
+    for review_id, stage in (new_value or {}).items():
+        merged[str(review_id)] = stage
     return merged
 
 
@@ -571,6 +794,12 @@ class AgentState(MessagesState):
     # --- Run-level budget / review channels shared with the supervisor subgraph ---
     research_iterations: int
     max_iterations: int
+    # Review ids that were granted one extra, consumable supervisor turn, mapped to
+    # the review stage that granted it. The allowance is
+    # ``max_iterations + len(repair_grants)`` everywhere (entry guard, tool guard and
+    # the remaining-budget projection), so a revise cannot be granted by one node and
+    # blocked by another. A dict keyed by review id makes a re-merge idempotent.
+    repair_grants: Annotated[dict, repair_grant_reducer]
     task_ledger: Annotated[dict, task_ledger_reducer]
     review_history: Annotated[dict, review_history_reducer]
     report_version: int
@@ -594,6 +823,7 @@ class SupervisorState(TypedDict):
     task_ledger: Annotated[dict, task_ledger_reducer] = {}
     review_history: Annotated[dict, review_history_reducer] = {}
     max_iterations: int = 0
+    repair_grants: Annotated[dict, repair_grant_reducer] = {}
     review_stage_hint: Annotated[str, latest_reducer] = ""
     # Written by ``apply_review`` / ``validate_proposal`` when the research phase ends;
     # the parent reads these to decide whether the report may still be reviewed.
@@ -611,6 +841,7 @@ class ResearcherState(TypedDict):
     raw_notes: Annotated[list[str], override_reducer] = []
     task_card: Optional[TaskCard]
     run_id: str
+    brief: Optional[ResearchBrief]
     working_memory: Optional[WorkingMemory]
 
 class ResearcherOutputState(BaseModel):
@@ -690,37 +921,294 @@ def requirements_from_text(brief_text: str, user_text: str = "") -> tuple[list[R
     return requirements, constraints
 
 
-def claim_records_from_text(text: str, evidence_ids: List[str], task_id: str, *, limit: int = 40) -> list[ClaimRecord]:
+_PLAN_PREFIXES = (
+    "next step",
+    "next steps",
+    "todo",
+    "to do",
+    "follow up",
+    "follow-up",
+    "we need",
+    "need to",
+    "should fetch",
+    "下一步",
+    "接下来",
+    "待办",
+    "后续",
+    "计划",
+    "需要",
+    "建议",
+    "还要",
+    "sources",
+    "references",
+    "来源",
+    "参考",
+)
+
+
+def _asserts_something(sentence: str) -> bool:
+    """Return False for text that looks like a plan, a question or a bare citation.
+
+    The extractor is structural, so anything containing a URL or ``[E1]`` used to be
+    published as a ``fact`` — including ``Next step: fetch https://...`` and bare
+    ``[E1] [E4] — Title: https://...`` citation lines. Neither can support a
+    requirement, and a Reviewer rightly counts them as fabricated coverage.
+    """
+    text = sentence.strip(" -*\t#>")
+    # A trailing marker ("(evidence E2)", "（evidence E3）") is provenance, not prose:
+    # drop it before judging whether anything was actually asserted.
+    text = re.sub(r"[\s（(]*(?:evidence|摘录|来源)\s*[:：]?\s*E\d+[\s）)]*$", "", text, flags=re.IGNORECASE).strip(" -*\t#>")
+    if not text:
+        return False
+    if text.endswith(("?", "？")):
+        return False
+    # A dangling label ("... is summarized as stating:") announces content that is not
+    # there. Publishing it as a fact gave the Reviewer claims it could neither support
+    # nor refute, and blocked three readiness rounds in the F-D acceptance run.
+    if text.endswith((":", "：")):
+        return False
+    if text.lower().startswith(_PLAN_PREFIXES):
+        return False
+    # "Nothing was found" is an observation about the search, not a fact about the
+    # world, and it goes stale the moment a later search returns the page. Such claims
+    # contradicted their own evidence packet in every live acceptance attempt.
+    if re.search(
+        r"(not (?:found|returned|in the consulted)|no search|cannot confirm|could not (?:find|confirm|verify)|"
+        r"未(?:找到|检索到|发现|能确认|能核实)|没有(?:找到|检索到|发现)|无法(?:确认|核实|验证)|未能(?:找到|确认))",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    # A tool log ("tavily_search returned 3 results") describes the run, not the world.
+    if re.search(r"\b(tavily_search|think_tool|request_context|ConductResearch)\b", text):
+        return False
+    # First-person process talk is the agent describing what it will do, not a fact
+    # about the world ("I must not accept it as established without checking ...").
+    if re.match(r"^(i|we|let me|my|our|我|我们|本人)\b", text, re.IGNORECASE) or text.startswith(("我", "我们")):
+        return False
+    # A citation line without a statement: remove refs, URLs and separators, then see
+    # whether anything assertable is left.
+    # A short label followed by a URL is a citation line ("Title: https://..."), not a
+    # statement: there is nothing in it that a source could support or contradict.
+    tail = re.search(r"https?://\S+$", text)
+    if tail:
+        prefix = text[: tail.start()]
+        label = re.sub(r"\[(?:E\d+|\d+)\]", " ", prefix)
+        label = label.strip(" \-—–:：|,，.。;；()（）[]")
+        # A clause separator means there is prose before the link; a bare title does
+        # not. An inline citation ("... 2024-09-26 (https://...)") is provenance
+        # attached to a complete assertion, not a label, even when it is short.
+        inline = bool(re.search(r"[(（]\s*$", prefix))
+        if len(label) <= 40 and not inline and not re.search(r"[，,。；;！!]", label):
+            return False
+    stripped = re.sub(r"\[(?:E\d+|\d+)\]", " ", text)
+    stripped = re.sub(r"https?://\S+", " ", stripped)
+    stripped = re.sub(r"[\s\-—–:：|,，.。;；()（）\[\]]+", "", stripped)
+    return len(stripped) >= 12
+
+
+_CITATION_PREFIX = re.compile(
+    r"^\s*(?:sources?|url|link|reference(?:s)?|source\s+url|来源|参考|链接|出处|原文|资料)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+_QUOTED_SPAN = re.compile(r'"[^"]*"|“[^”]*”|「[^」]*」|『[^』]*』', re.DOTALL)
+_ABBREVIATED_NUMBER = re.compile(r"\b(?:[A-Z]|App(?:endix)?|Section|Sec|Fig|No)\.\d+\.")
+_EXPLICIT_REF = re.compile(
+    r"\[(E\d+)\]|\((?:evidence\s*)?(E\d+)\)|(?:evidence|摘录|来源)\s*[:：]?\s*(E\d+)",
+    re.IGNORECASE,
+)
+
+
+def _split_claim_sentences(text: str) -> list[str]:
+    """Split a block into sentences without breaking headings or quoted spans.
+
+    A naive split on ``.`` turned ``## E.12. Release 17 / Release date: 2024-09-26``
+    into a claim that ended at ``## E.12.``; the actual date lived in the next line.
+    Quoted spans (which is where extractors keep verbatim source text) and appendix
+    style numbering are masked before splitting and restored afterwards.
+    """
+    placeholders: Dict[str, str] = {}
+
+    def stash(value: str) -> str:
+        key = f"\x01{len(placeholders)}\x01"
+        placeholders[key] = value
+        return key
+
+    masked = _QUOTED_SPAN.sub(lambda match: stash(match.group(0)), text)
+    masked = _ABBREVIATED_NUMBER.sub(lambda match: stash(match.group(0)), masked)
+    parts = [part for part in re.split(r"(?<=[.!?。！？])\s+|\n+", masked) if part.strip()]
+    restored = [part.strip() for part in parts]
+    for key, value in placeholders.items():
+        restored = [part.replace(key, value) for part in restored]
+    return [part for part in restored if part]
+
+
+def _is_citation_line(line: str) -> bool:
+    """Return True for a bare source/URL line that belongs to the previous fact."""
+    stripped = line.strip(" -*\t#>")
+    if not stripped:
+        return False
+    has_ref = "http://" in stripped or "https://" in stripped or bool(re.search(r"\[(?:E\d+|\d+)\]", stripped))
+    if not has_ref:
+        return False
+    if _CITATION_PREFIX.match(stripped):
+        return True
+    return bool(re.fullmatch(r"(?:\[(?:E\d+|\d+)\][\s,，;；—–-]*)*https?://\S+", stripped))
+
+
+def _claim_units(text: str) -> list[str]:
+    """Group a compressed result into statement units without losing the source line.
+
+    ``Fact sentence`` on one line and ``Source: [E2] URL`` on the next are one claim:
+    the old splitter dropped the fact (no marker on that line) and filtered the source
+    line, so a correct answer yielded zero claims.
+    """
+    blocks: list[str] = []
+    current = ""
+    placeholders: Dict[str, str] = {}
+
+    def stash_quote(match: re.Match) -> str:
+        key = f"\x02{len(placeholders)}\x02"
+        placeholders[key] = match.group(0)
+        return key
+
+    # A verbatim quote may contain blank lines and headings. Mask it before the line
+    # loop so the date inside the quote stays attached to the sentence that cites it.
+    masked_text = _QUOTED_SPAN.sub(stash_quote, text)
+    for raw in masked_text.splitlines():
+        line = raw.strip()
+        if not line:
+            if current:
+                blocks.append(current)
+                current = ""
+            continue
+        if not current:
+            current = line
+            continue
+        if _is_citation_line(line) or not _asserts_something(line):
+            current = current + "\n" + line
+            continue
+        blocks.append(current)
+        current = line
+    if current:
+        blocks.append(current)
+
+    units: list[str] = []
+    for block in blocks:
+        assembled = ""
+        assembled_asserts = False
+        for sentence in _split_claim_sentences(block):
+            if not assembled:
+                assembled = sentence
+                assembled_asserts = _asserts_something(sentence)
+            elif _is_citation_line(sentence):
+                assembled = assembled + "\n" + sentence
+            elif _asserts_something(sentence):
+                if assembled_asserts:
+                    units.append(assembled)
+                assembled = sentence
+                assembled_asserts = True
+            else:
+                assembled = assembled + " " + sentence
+        # A block that never asserted anything (a label, a source list, a plan) is
+        # dropped as a whole instead of being published under the first URL it saw.
+        if assembled and assembled_asserts:
+            units.append(assembled)
+    restored: list[str] = []
+    for unit in units:
+        for key, value in placeholders.items():
+            unit = unit.replace(key, value)
+        restored.append(unit)
+    return restored
+
+
+def _statement_without_citation(unit: str) -> str:
+    """Keep the asserted prose; citation-only lines are provenance, not the claim."""
+    parts = [line.strip() for line in unit.splitlines() if line.strip() and not _is_citation_line(line)]
+    return " ".join(parts).strip()
+
+
+def _normalize_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    value = value.split("#", 1)[0]
+    return value.rstrip("/")
+
+
+def evidence_url_map(evidence_index: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
+    """Map an exact archived URL to its evidence id (never a positional guess)."""
+    mapping: Dict[str, str] = {}
+    for row in evidence_index or []:
+        eid = str(row.get("evidence_id") or "")
+        if not eid:
+            continue
+        for key in ("url", "original_url", "canonical_url"):
+            url = _normalize_url(row.get(key) or "")
+            if url and url not in mapping:
+                mapping[url] = eid
+    return mapping
+
+
+def claim_records_from_text(
+    text: str,
+    evidence_ids: List[str],
+    task_id: str,
+    *,
+    limit: int = 40,
+    evidence_index: Optional[List[Dict[str, Any]]] = None,
+) -> list[ClaimRecord]:
     """Extract atomic-looking claims from compressed research (structural, not semantic).
 
-    This is deliberately conservative: claims are recorded only where there is a URL or
-    an ``[E<n>]`` reference nearby, and their support status stays ``unchecked``. The
-    Reviewer and the evaluator decide semantic support; this function never does.
+    A claim is recorded only when the text cites something the host can resolve: an
+    explicit ``[E<n>]`` id that exists, or a URL that exactly matches an archived
+    source. Unknown explicit ids are kept as an *unbound* claim (``evidence_refs=[]``)
+    instead of being silently re-pointed at the first evidence of the task; there is
+    no positional fallback. Support status stays ``unchecked``: a locatable marker is
+    not semantic support, which is the Reviewer's call.
     """
     if not text:
         return []
     from open_deep_research.artifacts import sha256_text
 
+    known = set(evidence_ids or [])
+    url_map = evidence_url_map(evidence_index)
     claims: list[ClaimRecord] = []
-    sentences = [s.strip(" -*\t#") for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s and len(s.strip()) > 20]
-    cited: list[str] = []
-    for sentence in sentences:
-        explicit = re.findall(r"\[(E\d+)\]", sentence)
-        has_url = "http://" in sentence or "https://" in sentence
-        if not explicit and not has_url:
+    for unit in _claim_units(text):
+        explicit = list(
+            dict.fromkeys(next(group for group in match if group) for match in _EXPLICIT_REF.findall(unit))
+        )
+        urls = list(dict.fromkeys(re.findall(r"https?://[^\s\]\)>,，。；;\"']+", unit)))
+        if not explicit and not urls:
             continue
-        refs = sorted({eid for eid in explicit if eid in evidence_ids}) or list(evidence_ids[:1])
-        if not refs:
+        statement = _statement_without_citation(unit)
+        if not statement or not _asserts_something(statement):
             continue
-        cited.extend(refs)
-        digest = sha256_text(f"{task_id}:{sentence[:200]}")[:10]
+        refs = [eid for eid in explicit if eid in known]
+        unknown = [eid for eid in explicit if eid not in known]
+        if unknown:
+            # An explicit citation the host cannot resolve makes the claim unbound:
+            # falling back to a URL in the same sentence would silently replace the
+            # source the extractor named (the E999 -> E1 re-pointing defect).
+            refs = []
+        else:
+            for url in urls:
+                mapped = url_map.get(_normalize_url(url))
+                if mapped and mapped in known and mapped not in refs:
+                    refs.append(mapped)
+        digest = sha256_text(f"{task_id}:{statement[:200]}")[:10]
         claims.append(
             ClaimRecord(
                 claim_id=f"C-{digest}",
-                statement=sentence[:500],
+                statement=statement[:800],
                 kind=ClaimKind.FACT,
                 evidence_refs=refs,
                 support_status=SupportStatus.UNCHECKED,
+                source_urls=urls[:4],
+                unknown_refs=unknown,
+                unbound_reason=(
+                    "unknown evidence id(s): " + ", ".join(unknown) if unknown and not refs else ""
+                ),
             )
         )
         if len(claims) >= limit:

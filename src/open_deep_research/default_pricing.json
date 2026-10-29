@@ -1,0 +1,62 @@
+{
+  "schema_version": "odr-pricing-v1",
+  "created_at_utc": "2026-10-26T00:00:00Z",
+  "currency": "USD",
+  "unit": "per_million_tokens",
+  "status": "verified",
+  "note": "Frozen from the provider's published price list on 2026-10-26 and recorded with URL and fetch time. Peak rates are used for every category: off-peak rates are half the peak rates (01:00-04:00 and 06:00-10:00 UTC, Mon-Fri, excluding Chinese public holidays), so a peak-rate estimate is a conservative upper bound at any hour. DeepSeek publishes no separate cache-write price: a cache write is billed as a cache-miss input token, so cache_write equals uncached_input here and estimate_cost treats it as an uncached token. A model with no entry here is unknown, not free, and refuses a paid run.",
+  "price_basis": "peak_rate_upper_bound",
+  "categories": [
+    "uncached_input",
+    "cache_read",
+    "cache_write",
+    "output"
+  ],
+  "models": {
+    "deepseek:deepseek-flash": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "model_version": "DeepSeek-V4.1-Flash-1017",
+      "pricing_status": "verified",
+      "effective_from": "2026-10-26",
+      "uncached_input": 0.3,
+      "cache_read": 0.006,
+      "cache_write": 0.3,
+      "output": 1.2,
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "fetched_at_utc": "2026-10-26T15:03:27+00:00",
+      "capabilities": {
+        "tool_calling": true,
+        "structured_output": true,
+        "json_output": true,
+        "context_window": 1048576,
+        "max_output_tokens": 393216,
+        "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+        "observed_at_utc": "2026-10-26T15:01:00+00:00"
+      }
+    },
+    "deepseek:deepseek-v4-pro": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "model_version": "DeepSeek-V4-Pro-0813",
+      "pricing_status": "verified",
+      "effective_from": "2026-10-26",
+      "uncached_input": 1.32,
+      "cache_read": 0.044,
+      "cache_write": 1.32,
+      "output": 3.96,
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "fetched_at_utc": "2026-10-26T15:03:27+00:00",
+      "capabilities": {
+        "tool_calling": true,
+        "structured_output": true,
+        "json_output": true,
+        "context_window": 1048576,
+        "max_output_tokens": 393216,
+        "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+        "observed_at_utc": "2026-10-26T15:01:00+00:00"
+      }
+    }
+  },
+  "unknown_model_policy": "reject_paid_run"
+}

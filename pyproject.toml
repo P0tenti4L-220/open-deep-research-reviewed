@@ -54,15 +54,22 @@ requires = ["setuptools>=73.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["open_deep_research", "legacy", "tests"]
+packages = ["open_deep_research", "legacy"]
 
 [tool.setuptools.package-dir]
 "open_deep_research" = "src/open_deep_research"
 "legacy" = "src/legacy"
-"tests" = "tests"
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
+"open_deep_research" = [
+    "default_pricing.json",
+    "context_policy/*.md",
+    "context_policy/*.txt",
+    "context_policy/*.json",
+    "context_policy/roles/*.md",
+    "context_policy/tool_guides/*.md",
+]
 
 [tool.ruff]
 lint.select = [

@@ -25,6 +25,7 @@ import os
 import re
 import tempfile
 import threading
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,7 @@ from open_deep_research.state import (
     ContextManifest,
     EvidenceRecord,
     ResearchBrief,
+    RevalidationEvent,
     TaskResult,
     UsageRecord,
 )
@@ -42,8 +44,13 @@ from open_deep_research.state import (
 LOGGER = logging.getLogger(__name__)
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ASCII_TERM_RE = re.compile(r"[A-Za-z0-9_./:-]{2,}")
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+# Credential-named fields only. A substring match on "token" also redacted token
+# *counts* (``estimated_input_tokens``), which destroyed the audit trail for exactly
+# the budget events an operator needs to read.
 _SECRET_KEY_RE = re.compile(
-    r"(api[_-]?key|secret|token|password|passwd|authorization|credential|bearer)",
+    r"^(?:.*[_-])?(?:api[_-]?key|key|keys|secret|secrets|token|tokens_secret|password|passwd|authorization|credential|credentials|bearer)$",
     re.IGNORECASE,
 )
 
@@ -51,6 +58,18 @@ _SECRET_KEY_RE = re.compile(
 _PRIVATE_ROLES = {"researcher", "supervisor", "writer"}
 # Roles whose events are operator-only and never readable by sibling agents.
 _OPERATOR_ONLY_ROLES = {"reviewer"}
+
+
+def _canonical_source_url(url: str) -> str:
+    """Normalize a source url for duplicate detection (scheme/host case, fragment)."""
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(value)
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, ""))
 
 
 class ArtifactError(Exception):
@@ -94,9 +113,57 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
+def search_terms(text: str) -> List[str]:
+    """Return retrieval terms, including CJK bigrams when the text has no spaces.
+
+    A Chinese request such as ``企业版的数据保留期`` is one unspaced run. Treating the
+    whole run as a single term makes exact-substring matching fail even when the
+    archived sentence obviously contains the condition. Bigrams keep the lookup
+    lexical (no model, no translation) while making unspaced Chinese searchable.
+    ASCII words are unchanged.
+    """
+    terms: List[str] = []
+    seen: set = set()
+
+    def add(term: str) -> None:
+        lowered = term.lower()
+        if lowered and lowered not in seen:
+            seen.add(lowered)
+            terms.append(lowered)
+
+    for match in _ASCII_TERM_RE.findall(text or ""):
+        add(match)
+    for run in _CJK_RUN_RE.findall(text or ""):
+        if len(run) == 1:
+            add(run)
+        else:
+            for index in range(len(run) - 1):
+                add(run[index : index + 2])
+    return terms
+
+
 def hash_obj(obj: Any) -> str:
     """Return a stable hash of a JSON-serialisable object."""
     return sha256_text(json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str))
+
+
+def claim_digest(claim: Any) -> str:
+    """Return a stable digest of the parts of a claim a re-check vouches for.
+
+    A receipt binds a claim's *content*, not just its id: editing the statement (or
+    swapping its evidence) after the check must make the receipt stale, so the digest
+    covers the statement, kind, evidence refs, requirement ids and version.
+    """
+    data = claim.model_dump(mode="json") if hasattr(claim, "model_dump") else dict(claim or {})
+    payload = {
+        "claim_id": data.get("claim_id"),
+        "statement": data.get("statement"),
+        "kind": data.get("kind"),
+        "evidence_refs": list(data.get("evidence_refs") or []),
+        "requirement_ids": list(data.get("requirement_ids") or []),
+        "version": int(data.get("version", 1) or 1),
+    }
+    return hash_obj(payload)
 
 
 def safe_id(value: Optional[str], fallback: str = "") -> str:
@@ -240,6 +307,10 @@ class _RunMeta:
         self.tool_calls = 0
         self.model_calls = 0
         self.published: Dict[str, Dict[str, Any]] = {}
+        # Non-evidence tool results (repo/MCP output) that the model was promised it
+        # could recover. Kept separate from the evidence index so an offloaded tool
+        # log never masquerades as a citable source.
+        self.tool_artifacts: Dict[str, Dict[str, Any]] = {}
         # The graph a run was started with; a resumed thread must stay on it.
         self.graph_name = ""
         self._load()
@@ -254,6 +325,9 @@ class _RunMeta:
     def _usage_path(self) -> Path:
         return self.run_dir / "metrics" / "usage.json"
 
+    def _artifacts_path(self) -> Path:
+        return self.run_dir / "artifacts" / "index.json"
+
     def _load(self) -> None:
         try:
             index = json.loads(self._index_path().read_text(encoding="utf-8"))
@@ -265,6 +339,16 @@ class _RunMeta:
             pass
         except Exception:  # noqa: BLE001 - corrupted index must not crash the run
             LOGGER.warning("Could not read evidence index for run %s", self.run_id)
+        try:
+            index = json.loads(self._artifacts_path().read_text(encoding="utf-8"))
+            for entry in index.get("artifacts", []):
+                artifact_id = entry.get("artifact_id")
+                if artifact_id:
+                    self.tool_artifacts[artifact_id] = entry
+        except FileNotFoundError:
+            pass
+        except Exception:  # noqa: BLE001 - corrupted index must not crash the run
+            LOGGER.warning("Could not read tool artifact index for run %s", self.run_id)
         try:
             ledger = json.loads(self._grants_path().read_text(encoding="utf-8"))
             for entry in ledger.get("grants", []):
@@ -313,6 +397,10 @@ class _RunMeta:
         payload = {"run_id": self.run_id, "updated_at": utc_now(), "evidence": list(self.evidence.values())}
         _atomic_write(self._index_path(), json.dumps(payload, indent=2, ensure_ascii=False, default=str))
 
+    def _persist_artifacts(self) -> None:
+        payload = {"run_id": self.run_id, "updated_at": utc_now(), "artifacts": list(self.tool_artifacts.values())}
+        _atomic_write(self._artifacts_path(), json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+
     def _persist_grants(self) -> None:
         grants = [asdict(g) for items in self.grants.values() for g in items]
         _atomic_write(self._grants_path(), json.dumps({"run_id": self.run_id, "grants": grants}, indent=2, ensure_ascii=False))
@@ -360,6 +448,8 @@ class ArtifactStore:
                 meta = _RunMeta(self.run_dir)
                 _META[str(self.run_dir)] = meta
             self._meta = meta
+        # Where the verified price table came from (audit trail; None = built-in table).
+        self.pricing_path: Optional[str] = None
         (self.run_dir / "evidence" / "objects").mkdir(parents=True, exist_ok=True)
 
     # -- convenience -------------------------------------------------------
@@ -428,6 +518,156 @@ class ArtifactStore:
             _atomic_write(path, text)
         return {"content_hash": content_hash, "chars": len(text), "url": url, "title": title}
 
+    def archive_tool_result(
+        self,
+        identity: Identity,
+        text: str,
+        *,
+        title: str = "",
+        call_id: str = "",
+    ) -> Dict[str, Any]:
+        """Archive a non-evidence tool result and make it recoverable by id.
+
+        Repository/MCP output is not a citable source, but it is still material the
+        model may need after a trim. It gets its own owner-scoped index entry so
+        ``request_context`` can read it back without polluting the evidence manifest.
+        """
+        doc = self.archive_document(identity, text, title=title)
+        artifact_id = f"artifact://tool-results/{doc['content_hash']}"
+        owner = {"task_id": identity.task_id or "", "agent_instance_id": identity.agent_instance_id}
+        with self._meta.lock:
+            entry = self._meta.tool_artifacts.get(artifact_id)
+            if entry is None:
+                entry = {
+                    "artifact_id": artifact_id,
+                    "content_hash": doc["content_hash"],
+                    "chars": doc["chars"],
+                    "title": title,
+                    "url": "",
+                    "call_id": call_id,
+                    "created_at": utc_now(),
+                    "owners": [owner],
+                }
+                self._meta.tool_artifacts[artifact_id] = entry
+            elif owner not in entry.setdefault("owners", []):
+                entry["owners"].append(owner)
+            self._meta._persist_artifacts()
+        self._append_agent_event(
+            identity,
+            {"type": "artifact_created", "artifact_id": artifact_id, "chars": doc["chars"], "call_id": call_id},
+        )
+        return dict(entry)
+
+    def _artifact_entry(self, artifact_id: str) -> Dict[str, Any]:
+        if not isinstance(artifact_id, str) or not re.match(r"^artifact://tool-results/[0-9a-f]{16,64}$", artifact_id):
+            raise InvalidArtifactId("Invalid tool artifact id")
+        with self._meta.lock:
+            entry = self._meta.tool_artifacts.get(artifact_id)
+        if entry is None:
+            raise MissingEvidence(f"Tool artifact {artifact_id} does not exist")
+        return entry
+
+    @staticmethod
+    def _check_artifact_access(identity: Identity, entry: Dict[str, Any]) -> None:
+        owners = entry.get("owners") or []
+        if any(
+            owner.get("agent_instance_id") == identity.agent_instance_id
+            or (identity.task_id and owner.get("task_id") == identity.task_id)
+            for owner in owners
+        ):
+            return
+        raise PermissionDenied("Tool artifact is not readable by this identity")
+
+    def can_read_artifact(self, identity: Identity, artifact_id: str) -> bool:
+        """Return whether ``identity`` owns this archived tool result (no event)."""
+        entry = self._meta.tool_artifacts.get(artifact_id)
+        if entry is None:
+            return False
+        try:
+            self._check_artifact_access(identity, entry)
+        except PermissionDenied:
+            return False
+        return True
+
+    def read_artifact(
+        self,
+        identity: Identity,
+        artifact_id: str,
+        *,
+        query: str = "",
+        max_chars: int = 900,
+    ) -> Dict[str, Any]:
+        """Read a bounded, owner-checked window of one archived tool result."""
+        entry = self._artifact_entry(artifact_id)
+        try:
+            self._check_artifact_access(identity, entry)
+        except PermissionDenied:
+            self._append_agent_event(identity, {"type": "artifact_read_denied", "artifact_id": artifact_id})
+            raise
+        path = self._resolve_inside(self._object_path(entry["content_hash"]))
+        body = path.read_text(encoding="utf-8")
+        cap = max(200, int(max_chars))
+        text = self._best_query_window(body, query, cap) if query else ""
+        if not text:
+            text = body[:cap]
+        self._append_agent_event(identity, {"type": "read_artifact", "artifact_id": artifact_id})
+        return {
+            "status": "ok",
+            "artifact_id": artifact_id,
+            "title": entry.get("title", ""),
+            "url": entry.get("url", ""),
+            "retrieved_at": entry.get("created_at", ""),
+            "content_hash": entry.get("content_hash", ""),
+            "excerpt": text,
+            "truncated": len(text) < len(body),
+        }
+
+    def search_artifacts(
+        self,
+        identity: Identity,
+        terms: Iterable[str],
+        *,
+        limit: int = 8,
+        max_scan: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Rank this identity's own archived tool results by keyword overlap."""
+        wanted = [str(term).strip().lower() for term in terms if str(term).strip()]
+        if not wanted:
+            return []
+        ranked: List[Dict[str, Any]] = []
+        scanned = 0
+        with self._meta.lock:
+            entries = list(self._meta.tool_artifacts.items())
+        for artifact_id, entry in entries:
+            if not self.can_read_artifact(identity, artifact_id):
+                continue
+            if scanned >= max_scan:
+                break
+            scanned += 1
+            metadata = " ".join(str(entry.get(key) or "") for key in ("title", "url", "call_id")).lower()
+            score = sum(1 for term in wanted if term in metadata)
+            matched_in = "metadata" if score else ""
+            if not score:
+                try:
+                    path = self._resolve_inside(self._object_path(entry["content_hash"]))
+                    body = path.read_text(encoding="utf-8").lower()
+                except Exception:  # noqa: BLE001 - a lost object is a missing source, not a crash
+                    body = ""
+                score = sum(1 for term in wanted if term in body)
+                matched_in = "full_text" if score else ""
+            if score:
+                ranked.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "score": score,
+                        "title": entry.get("title", ""),
+                        "url": entry.get("url", ""),
+                        "matched_in": matched_in,
+                    }
+                )
+        ranked.sort(key=lambda item: (-item["score"], item["artifact_id"]))
+        return ranked[: max(1, int(limit))]
+
     def add_evidence(
         self,
         identity: Identity,
@@ -443,8 +683,40 @@ class ArtifactStore:
         public: bool = False,
         attempt: int = 0,
     ) -> EvidenceRecord:
-        """Store one evidence record and index it for the current identity."""
+        """Store one evidence record and index it for the current identity.
+
+        The same document delivered again (same url and content hash, typically the
+        same page returned by two queries) reuses the existing evidence id instead of
+        becoming a second "source" with a different excerpt. A second task gets a read
+        grant, so reuse does not silently hide the document from it.
+        """
         doc = self.archive_document(identity, content, url=source_url, title=title)
+        canonical = _canonical_source_url(source_url)
+        reused_id = ""
+        with self._meta.lock:
+            for existing_id, existing in self._meta.evidence.items():
+                if existing.get("content_hash") != doc["content_hash"]:
+                    continue
+                if _canonical_source_url(existing.get("original_url", "")) != canonical:
+                    continue
+                reused_id = existing_id
+                reused = dict(existing)
+                task_attempts = existing.setdefault("_task_attempts", {})
+                attempts = task_attempts.setdefault(identity.task_id or "", [])
+                if attempt not in attempts:
+                    attempts.append(attempt)
+                self._meta._persist_index()
+                break
+        if reused_id:
+            if not reused.get("public") and (reused.get("_owner_task") or "") != (identity.task_id or ""):
+                self.grant_evidence(
+                    reused_id,
+                    grantee_agent_id=identity.agent_instance_id,
+                    grantee_task_id=identity.task_id or "",
+                    granted_by="archive_reuse",
+                )
+            self._append_agent_event(identity, {"type": "evidence_reused", "evidence_id": reused_id, "url": source_url})
+            return EvidenceRecord(**{key: value for key, value in reused.items() if not key.startswith("_")})
         exact = excerpt or content[:600]
         if exact and exact not in content:
             # The excerpt must be locatable in the archived object; otherwise keep the
@@ -474,6 +746,7 @@ class ArtifactStore:
             entry = record.model_dump(mode="json")
             entry["_owner_task"] = identity.task_id or ""
             entry["_owner_attempt"] = attempt
+            entry["_task_attempts"] = {identity.task_id or "": [attempt]}
             entry["_owner_agent"] = identity.agent_instance_id
             entry["_registered_by"] = identity.agent_instance_id
             self._meta.evidence[evidence_id] = entry
@@ -563,7 +836,10 @@ class ArtifactStore:
         """Return the archived original document behind an evidence id."""
         record = self.get_evidence(identity, evidence_id)
         path = self._resolve_inside(self._object_path(record.content_hash))
-        return path.read_text(encoding="utf-8")
+        body = path.read_text(encoding="utf-8")
+        if sha256_text(body) != record.content_hash:
+            raise ArtifactError(f"archived object for {evidence_id} no longer matches its content_hash")
+        return body
 
     def read_excerpt(
         self,
@@ -588,12 +864,7 @@ class ArtifactStore:
             text = body[:char_cap]
         elif selector == "query":
             body = self.read_evidence_text(identity, evidence_id)
-            idx = body.lower().find((query or "").lower()) if query else -1
-            if idx < 0:
-                text = record.exact_excerpt[:char_cap]
-            else:
-                start = max(0, idx - char_cap // 3)
-                text = body[start : start + char_cap]
+            text = self._best_query_window(body, query, char_cap) or record.exact_excerpt[:char_cap]
         else:
             text = record.exact_excerpt[:char_cap]
         return {
@@ -606,6 +877,33 @@ class ArtifactStore:
             "excerpt": text,
             "truncated": len(text) >= char_cap,
         }
+
+    @staticmethod
+    def _best_query_window(body: str, query: str, char_cap: int) -> str:
+        """Return the passage of ``body`` that best matches the query terms.
+
+        A natural-language need ("the v2 retention exception") rarely appears verbatim,
+        so an exact substring search used to fall back to the document head - exactly
+        the place where the exception is *not*. The body is scored in overlapping
+        windows instead; the best window is returned verbatim.
+        """
+        terms = search_terms(query or "")
+        if not terms or not body:
+            return ""
+        lowered = body.lower()
+        window = max(200, int(char_cap))
+        stride = max(100, window // 2)
+        best_score = 0
+        best_start = 0
+        for start in range(0, max(1, len(body) - stride), stride):
+            chunk = lowered[start : start + window]
+            score = sum(1 for term in terms if term in chunk)
+            if score > best_score:
+                best_score = score
+                best_start = start
+        if not best_score:
+            return ""
+        return body[best_start : best_start + char_cap]
 
     def grant_evidence(self, evidence_id: str, *, grantee_agent_id: str, grantee_task_id: str, granted_by: str) -> None:
         """Grant read access of one evidence item to one task (host policy only)."""
@@ -635,12 +933,18 @@ class ArtifactStore:
         self._append_agent_event(identity, {"type": "evidence_published", "evidence_ids": list(evidence_ids), "reason": reason})
 
     def evidence_for_task(self, task_id: str, attempt: Optional[int] = None) -> List[str]:
-        """Return ids of evidence owned by one task (host-internal use)."""
+        """Return sources delivered to this task, including reused snapshots."""
         with self._meta.lock:
             return [
                 eid
                 for eid, entry in self._meta.evidence.items()
-                if entry.get("_owner_task") == task_id and (attempt is None or entry.get("_owner_attempt") == attempt)
+                if (
+                    entry.get("_owner_task") == task_id
+                    and (attempt is None or entry.get("_owner_attempt") == attempt)
+                ) or (
+                    task_id in entry.get("_task_attempts", {})
+                    and (attempt is None or attempt in entry["_task_attempts"][task_id])
+                )
             ]
 
     def counter_evidence_for(self, identities: Iterable[Identity]) -> List[str]:
@@ -654,24 +958,137 @@ class ArtifactStore:
         with self._meta.lock:
             return [{"evidence_id": eid, "title": entry.get("title", ""), "url": entry.get("original_url", "")} for eid, entry in self._meta.evidence.items()]
 
-    def read_evidence_for_review(self, evidence_ids: Iterable[str], limit: int = 24) -> List[Dict[str, Any]]:
-        """Reviewer-only bulk excerpt reader (scope is the packet's evidence list)."""
+    def read_evidence_for_review(
+        self,
+        evidence_ids: Iterable[str],
+        limit: Optional[int] = None,
+        focus: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Reviewer-only bulk excerpt reader (scope is the packet's evidence list).
+
+        ``limit=None`` reads *every* id in the packet. The old default of 24 silently
+        turned archived evidence into "missing" once a run had more than 24 sources,
+        which made the reviewer report a false gap and could block a correct report.
+        A caller that really wants a bounded read passes an explicit limit and must
+        treat the remainder as "not shown" rather than "not archived".
+
+        ``focus`` maps an evidence id to the claim statement/quote the review must
+        check. When the stored opening excerpt does not contain that text, a window
+        around it is added as ``relevant_excerpt`` with its offsets, so a fact in the
+        middle of a long page is visible instead of being called unsupported.
+        """
+        from open_deep_research.utils import select_relevant_window
+
+        ids = list(dict.fromkeys(evidence_ids))
+        if limit is not None:
+            ids = ids[: int(limit)]
         out: List[Dict[str, Any]] = []
-        for eid in list(evidence_ids)[:limit]:
+        for eid in ids:
             entry = self._meta.evidence.get(eid)
             if not entry:
                 continue
-            out.append(
-                {
-                    "evidence_id": eid,
-                    "url": entry.get("original_url", ""),
-                    "title": entry.get("title", ""),
-                    "retrieved_at": entry.get("retrieved_at", ""),
-                    "exact_excerpt": entry.get("exact_excerpt", "")[:1200],
-                    "is_counter_evidence": bool(entry.get("is_counter_evidence")),
-                }
-            )
+            excerpt = entry.get("exact_excerpt", "") or ""
+            shown = excerpt[:1200]
+            row: Dict[str, Any] = {
+                "evidence_id": eid,
+                "url": entry.get("original_url", ""),
+                "title": entry.get("title", ""),
+                "retrieved_at": entry.get("retrieved_at", ""),
+                "content_hash": entry.get("content_hash", ""),
+                "exact_excerpt": shown,
+                "excerpt_truncated": len(excerpt) > len(shown),
+                "is_counter_evidence": bool(entry.get("is_counter_evidence")),
+            }
+            needle = str((focus or {}).get(eid) or "").strip()
+            if needle and needle not in shown:
+                try:
+                    path = self._resolve_inside(self._object_path(entry["content_hash"]))
+                    body = path.read_text(encoding="utf-8")
+                except Exception:  # noqa: BLE001 - an unreadable object is not a support claim
+                    body = ""
+                if body:
+                    window, start, end = select_relevant_window(body, query=needle, limit=1200)
+                    if window and window not in shown:
+                        row["relevant_excerpt"] = window
+                        row["relevant_span"] = {"content_hash": entry["content_hash"], "start": start, "end": end}
+                        row["relevant_match"] = bool(window.strip())
+                        row["verbatim_match"] = needle in body
+            out.append(row)
         return out
+
+    def can_read_evidence(self, identity: Identity, evidence_id: str) -> bool:
+        """Return whether ``identity`` may read this evidence id (no event written).
+
+        Used by the recovery search to filter candidates *before* reading them, so a
+        denied id is not disclosed and the index is not enumerated to the model.
+        """
+        entry = self._meta.evidence.get(evidence_id)
+        if entry is None:
+            return False
+        try:
+            self._check_evidence_access(identity, entry)
+        except PermissionDenied:
+            return False
+        return True
+
+    def search_evidence(
+        self,
+        identity: Identity,
+        terms: Iterable[str],
+        *,
+        limit: int = 8,
+        scan_full_text: bool = True,
+        max_scan: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Rank this identity's readable evidence by keyword overlap.
+
+        The metadata (title, excerpt, url) is searched first. When that finds nothing,
+        the archived objects are scanned (bounded by ``max_scan``) so a term that only
+        appears in the omitted middle of a long document can still be recovered; the
+        excerpt alone must not become the whole searchable world.
+
+        Returns:
+            ``[{"evidence_id", "score", "title", "url", "matched_in"}]``, best first.
+        """
+        wanted = [str(term).strip().lower() for term in terms if str(term).strip()]
+        if not wanted:
+            return []
+        ranked: List[Dict[str, Any]] = []
+        with self._meta.lock:
+            entries = list(self._meta.evidence.items())
+        scanned = 0
+        for eid, entry in entries:
+            if not self.can_read_evidence(identity, eid):
+                continue
+            if scanned >= max_scan:
+                break
+            scanned += 1
+            haystack = " ".join(
+                str(entry.get(key) or "") for key in ("title", "original_url", "exact_excerpt")
+            ).lower()
+            score = sum(1 for term in wanted if term in haystack)
+            matched_in = "metadata" if score else ""
+            if not score and scan_full_text:
+                try:
+                    record = EvidenceRecord(**{k: v for k, v in entry.items() if not k.startswith("_")})
+                    path = self._resolve_inside(self._object_path(record.content_hash))
+                    body = path.read_text(encoding="utf-8").lower()
+                except Exception:  # noqa: BLE001 - a lost object is a missing source, not a crash
+                    body = ""
+                score = sum(1 for term in wanted if term in body)
+                matched_in = "full_text" if score else ""
+            if score:
+                ranked.append(
+                    {
+                        "evidence_id": eid,
+                        "score": score,
+                        "title": entry.get("title", ""),
+                        "url": entry.get("original_url", ""),
+                        "matched_in": matched_in,
+                    }
+                )
+        ranked.sort(key=lambda item: (-item["score"], item["evidence_id"]))
+        return ranked[: max(1, int(limit))]
 
     # -- published results -------------------------------------------------
     def publish_result(self, identity: Identity, task_result: TaskResult, expected_version: Optional[int] = None) -> Dict[str, Any]:
@@ -765,8 +1182,67 @@ class ArtifactStore:
     def write_claims(self, identity: Identity, claims: Iterable[ClaimRecord]) -> None:
         """Persist claims produced by a finding extractor to ``published/claims``."""
         for claim in claims:
-            path = self.run_dir / "published" / "claims" / safe_id(claim.claim_id) / f"{claim.version}.json"
-            _atomic_write(path, json.dumps({**_jsonable(claim), "_owner_task": identity.task_id, "_owner_agent": identity.agent_instance_id}, indent=2, ensure_ascii=False))
+            self.write_claim_version(claim, owner_task=identity.task_id or "", owner_agent=identity.agent_instance_id)
+
+    def write_claim_version(self, claim: ClaimRecord, *, owner_task: str, owner_agent: str) -> None:
+        """Write one claim version, keeping the task/agent that first produced it.
+
+        A host-applied revision is written by the supervisor identity, but the claim
+        still belongs to the researcher task whose evidence it cites: the owner fields
+        are carried over so readiness review can still see it.
+        """
+        path = self.run_dir / "published" / "claims" / safe_id(claim.claim_id) / f"{claim.version}.json"
+        _atomic_write(
+            path,
+            json.dumps(
+                {
+                    **_jsonable(claim),
+                    "_owner_task": owner_task,
+                    "_owner_agent": owner_agent,
+                    "_revision_written_by": "host",
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
+        self._append_event(
+            "control",
+            {
+                "type": "claim_version",
+                "claim_id": claim.claim_id,
+                "version": claim.version,
+                "status": getattr(claim.status, "value", claim.status),
+                "supersedes": claim.supersedes_version,
+            },
+        )
+
+    def bind_quote(self, evidence_id: str, quote: str) -> Dict[str, Any]:
+        """Locate a verbatim quote in an archived object (host validation only).
+
+        This is not a read interface for a model: it returns offsets and the content
+        hash, never the document. Callers must first establish that the evidence id is
+        in the run's scope (a claim's existing reference or an id published to it).
+        """
+        if not quote or len(quote) > 800:
+            raise ArtifactError("quote must be 1-800 characters")
+        entry = self._evidence_entry(evidence_id)
+        path = self._resolve_inside(self._object_path(entry["content_hash"]))
+        try:
+            body = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ArtifactError(f"archived object for {evidence_id} is unreadable: {exc}") from exc
+        if hashlib.sha256(body.encode("utf-8")).hexdigest() != entry["content_hash"]:
+            raise ArtifactError(f"archived object for {evidence_id} no longer matches its content_hash")
+        start = body.find(quote)
+        if start < 0:
+            raise ArtifactError(f"quote is not verbatim in the archived object of {evidence_id}")
+        return {
+            "evidence_id": evidence_id,
+            "content_hash": entry["content_hash"],
+            "start": start,
+            "end": start + len(quote),
+            "quote": quote,
+        }
 
     def all_claims(self) -> List[Dict[str, Any]]:
         """Return every claim written by finding extractors (host-internal)."""
@@ -786,6 +1262,32 @@ class ArtifactStore:
                 continue
         return out
 
+    def active_claims(self) -> List[Dict[str, Any]]:
+        """Return only the claims that are still active (latest version, not withdrawn).
+
+        Writer, coverage and report review must read this set; ``all_claims`` stays the
+        audit view so a withdrawn claim and its counter-evidence remain readable.
+        """
+        return [
+            claim
+            for claim in self.all_claims()
+            if str(claim.get("status") or "active") == "active"
+        ]
+
+    def get_claim(self, claim_id: str) -> Optional[Dict[str, Any]]:
+        """Return the latest stored version of one claim id, or None."""
+        safe = safe_id(claim_id)
+        folder = self.run_dir / "published" / "claims" / safe
+        if not folder.exists():
+            return None
+        files = sorted(folder.glob("*.json"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0)
+        if not files:
+            return None
+        try:
+            return json.loads(files[-1].read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+
     # -- books / ledgers ---------------------------------------------------
     def append_ledger(self, name: str, entry: Dict[str, Any]) -> None:
         """Append one entry to a host-written control ledger file."""
@@ -799,6 +1301,210 @@ class ArtifactStore:
     def append_event(self, entry: Dict[str, Any]) -> None:
         """Append one entry to the global ``control/events.jsonl``."""
         self.append_ledger("events", entry)
+
+    def reserve_search_queries(self, count: int, maximum: int, *, execution_id: str = "") -> str:
+        """Reserve query units before transport; failed calls still consume allowance."""
+        path = self.run_dir / "control" / "search_usage.jsonl"
+        with self._meta.lock:
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+            used = sum(int(row.get("query_count", 0)) for row in rows if row.get("phase") == "reserved")
+            if count < 0 or used + count > maximum:
+                raise ArtifactError(f"search query budget exhausted: {used}+{count} exceeds {maximum}")
+            request_id = "search-" + uuid.uuid4().hex[:12]
+            self.append_ledger("search_usage", {"request_id": request_id, "phase": "reserved", "query_count": count,
+                                               "maximum": maximum, "execution_id": execution_id, "endpoint": "tavily.search"})
+            return request_id
+
+    def cached_extraction(self, identity: Identity, evidence_id: str, key: str) -> Optional[str]:
+        """Read a successful extraction only after checking source access."""
+        self.get_evidence(identity, evidence_id)
+        path = self.run_dir / "evidence" / "extractions" / f"{safe_id(key)}.json"
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return str(payload["content"]) if payload.get("evidence_id") == evidence_id else None
+
+    def reserve_page_fetch(self, url: str, maximum: int) -> Optional[str]:
+        """Bound optional direct page reads, including failures, across the run."""
+        with self._meta.lock:
+            path = self.run_dir / "control" / "page_fetch_usage.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+            if sum(row.get("phase") == "reserved" for row in rows) >= maximum:
+                return None
+            request_id = "page-" + uuid.uuid4().hex[:12]
+            self.append_ledger("page_fetch_usage", {"request_id": request_id, "url": url, "phase": "reserved", "maximum": maximum, "transport": "direct_https"})
+            return request_id
+
+    def cache_extraction(self, evidence_id: str, key: str, content: str) -> None:
+        """Keep successful extraction output for an identical source/model/request."""
+        path = self.run_dir / "evidence" / "extractions" / f"{safe_id(key)}.json"
+        _atomic_write(path, json.dumps({"evidence_id": evidence_id, "content": content}, ensure_ascii=False))
+
+    def claim_review_findings(self) -> List[Dict[str, Any]]:
+        """Fold the host's persistent claim findings without deleting their history."""
+        path = self.run_dir / "control" / "claim_review_findings.jsonl"
+        if not path.exists():
+            return []
+        entries: Dict[str, Dict[str, Any]] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            key = str(row["finding_id"])
+            entries[key] = {**entries.get(key, {}), **row}
+        return list(entries.values())
+
+    # -- correction (revalidation) ledger ----------------------------------
+    def _revalidation_path(self) -> Path:
+        return self.run_dir / "control" / "revalidation.jsonl"
+
+    def revalidation_events(self) -> List[Dict[str, Any]]:
+        """Return the folded correction events, newest state per event id."""
+        path = self._revalidation_path()
+        events: Dict[str, Dict[str, Any]] = {}
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except Exception:  # noqa: BLE001 - one corrupt line must not hide the rest
+                continue
+            event_id = entry.get("event_id")
+            if event_id:
+                events[event_id] = {**events.get(event_id, {}), **entry}
+        return sorted(events.values(), key=lambda item: str(item.get("created_at", "")))
+
+    def open_revalidations(self) -> List[Dict[str, Any]]:
+        """Return correction events that no later result has resolved yet."""
+        return [event for event in self.revalidation_events() if event.get("status") == "open"]
+
+    def record_revalidation(self, event: RevalidationEvent | Dict[str, Any]) -> Dict[str, Any]:
+        """Append one correction event (host-owned; models cannot call this)."""
+        payload = event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event)
+        payload.setdefault("created_at", utc_now())
+        self.append_ledger("revalidation", payload)
+        self.append_event({"type": "revalidation_opened", "event_id": payload.get("event_id"), "task_id": payload.get("task_id"), "requirements": payload.get("affected_requirement_ids", [])})
+        return payload
+
+    def resolve_revalidation(self, event_id: str, *, resolved_by: str, reason: str = "") -> None:
+        """Mark one correction event resolved (keeps the full history on disk)."""
+        existing = next((event for event in self.revalidation_events() if event.get("event_id") == event_id), None)
+        if existing is None:
+            return
+        self.append_ledger(
+            "revalidation",
+            {
+                "event_id": event_id,
+                "status": "resolved",
+                "resolved_at": utc_now(),
+                "resolved_by": resolved_by,
+                "resolution": reason,
+                "task_id": existing.get("task_id", ""),
+                "affected_requirement_ids": existing.get("affected_requirement_ids", []),
+            },
+        )
+        self.append_event({"type": "revalidation_resolved", "event_id": event_id, "by": resolved_by, "reason": reason})
+
+    # -- revalidation receipts ---------------------------------------------
+    def evidence_snapshot(self, evidence_ids: Iterable[str]) -> List[Dict[str, Any]]:
+        """Return the current identity of each evidence record a receipt vouches for."""
+        snapshot: List[Dict[str, Any]] = []
+        with self._meta.lock:
+            for evidence_id in evidence_ids or []:
+                entry = self._meta.evidence.get(str(evidence_id))
+                if not entry:
+                    continue
+                snapshot.append(
+                    {
+                        "evidence_id": str(evidence_id),
+                        "content_hash": entry.get("content_hash", ""),
+                        "document_version": int(entry.get("document_version", 1) or 1),
+                    }
+                )
+        return snapshot
+
+    def revalidation_receipts(self, event_id: str = "") -> List[Dict[str, Any]]:
+        """Return the receipts issued for one correction event (or for the whole run)."""
+        path = self.run_dir / "control" / "revalidation_receipts.jsonl"
+        if not path.exists():
+            return []
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return [row for row in rows if not event_id or str(row.get("event_id") or "") == str(event_id)]
+
+    def record_revalidation_receipt(self, receipt: Any) -> Dict[str, Any]:
+        """Append one independent receipt to the append-only receipt ledger."""
+        payload = receipt.model_dump(mode="json") if hasattr(receipt, "model_dump") else dict(receipt or {})
+        payload.setdefault("created_at", utc_now())
+        payload["checker_kind"] = payload.get("checker_kind") or "independent_reviewer"
+        self.append_ledger("revalidation_receipts", payload)
+        self.append_event(
+            {
+                "type": "revalidation_receipt_issued",
+                "event_id": payload.get("event_id"),
+                "receipt_id": payload.get("receipt_id"),
+                "review_id": payload.get("review_id"),
+                "claims": payload.get("claim_ids", []),
+            }
+        )
+        return payload
+
+    def verify_revalidation_receipt(self, receipt: Any, event: Any, claims: Any) -> Tuple[bool, str]:
+        """Re-check one receipt against the *current* event, claims and evidence.
+
+        Returns ``(ok, reason)``. A stale hash (the claim was edited, the archived
+        object replaced) or an unchecked claim keeps the correction event open; the
+        caller records the reason so a rejected receipt is auditable.
+        """
+        row = receipt.model_dump(mode="json") if hasattr(receipt, "model_dump") else dict(receipt or {})
+        event_row = event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event or {})
+        if str(row.get("event_id") or "") != str(event_row.get("event_id") or ""):
+            return False, "event_mismatch"
+        if row.get("checker_kind") != "independent_reviewer" or not str(row.get("checker_identity") or "").strip():
+            return False, "not_an_independent_reviewer"
+        current: Dict[str, Any] = {}
+        if isinstance(claims, dict):
+            current = {str(key): value for key, value in claims.items()}
+        else:
+            for claim in claims or []:
+                data = claim.model_dump(mode="json") if hasattr(claim, "model_dump") else dict(claim or {})
+                current[str(data.get("claim_id"))] = data
+        claim_ids = [str(cid) for cid in (row.get("claim_ids") or [])]
+        if not claim_ids:
+            return False, "no_claim_checked"
+        for claim_id in claim_ids:
+            if claim_id not in current:
+                return False, f"claim_missing:{claim_id}"
+            expected = (row.get("claim_hashes") or {}).get(claim_id)
+            if not expected or claim_digest(current[claim_id]) != expected:
+                return False, f"stale_claim_hash:{claim_id}"
+        for evidence_id in row.get("evidence_ids") or []:
+            entry = self._meta.evidence.get(str(evidence_id))
+            if not entry:
+                return False, f"evidence_missing:{evidence_id}"
+            expected = (row.get("evidence_hashes") or {}).get(str(evidence_id))
+            if not expected or entry.get("content_hash") != expected:
+                return False, f"stale_evidence_hash:{evidence_id}"
+        verdicts = row.get("verdicts") or {}
+        for claim_id in claim_ids:
+            verdict = str(verdicts.get(claim_id) or "")
+            if verdict not in {"verified_supported", "verified_contradicted"}:
+                return False, f"claim_not_verified:{claim_id}"
+        affected = {str(rid) for rid in (event_row.get("affected_requirement_ids") or [])}
+        covered = {str(rid) for claim_id in claim_ids for rid in (current.get(claim_id, {}).get("requirement_ids") or [])}
+        if affected and not affected.intersection(covered):
+            return False, "requirements_not_covered"
+        return True, ""
+
+    def valid_revalidation_receipt(self, event: Any, claims: Any) -> Optional[Dict[str, Any]]:
+        """Return the newest receipt that still verifies for this event, if any."""
+        row = event.model_dump(mode="json") if hasattr(event, "model_dump") else dict(event or {})
+        for receipt in reversed(self.revalidation_receipts(str(row.get("event_id") or ""))):
+            ok, _reason = self.verify_revalidation_receipt(receipt, row, claims)
+            if ok:
+                return receipt
+        return None
 
     def _append_event(self, _scope: str, entry: Dict[str, Any]) -> None:
         self.append_event(entry)
@@ -820,6 +1526,30 @@ class ArtifactStore:
         """Public wrapper to record an event for one agent invocation."""
         if identity.role in _OPERATOR_ONLY_ROLES or identity.role in _PRIVATE_ROLES:
             self._append_agent_event(identity, entry)
+
+    def agent_events(self, identity: Identity, *, limit: int = 200) -> List[Dict[str, Any]]:
+        """Return this invocation's own event rows (newest last, bounded).
+
+        Used by the runtime to rebuild the working state from what actually happened
+        (tool results, failures, recoveries) instead of trusting a model summary.
+        """
+        folder = self._role_dir(identity)
+        if folder is None:
+            return []
+        path = folder / "events.jsonl"
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        events: List[Dict[str, Any]] = []
+        for line in lines[-max(1, int(limit)) :]:
+            try:
+                events.append(json.loads(line))
+            except Exception:  # noqa: BLE001
+                continue
+        return events
 
     def write_working_memory(self, identity: Identity, memory: Dict[str, Any]) -> None:
         """Persist the compact working memory of one invocation."""
@@ -881,6 +1611,23 @@ class ArtifactStore:
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"at": utc_now(), "kind": "model", **_jsonable(usage)}, ensure_ascii=False, default=str) + "\n")
 
+    @staticmethod
+    def _committed_tokens(entry: Dict[str, Any]) -> int:
+        """Tokens one reservation still holds against the run-wide cap.
+
+        A settled request whose provider reported usage commits what it actually spent:
+        the estimate was only a hold. Keeping ``max(settled, estimate)`` made every
+        settled call keep its conservative output charge forever, so a run with 40k real
+        tokens could be refused at 190k committed (observed in the F-D acceptance run).
+        A call with unknown usage keeps its estimate, since the charge is unknown.
+        """
+        estimate = int(entry.get("estimated_input_tokens", 0)) + int(entry.get("estimated_output_tokens", 0))
+        if not entry.get("settled"):
+            return estimate
+        if entry.get("usage_known"):
+            return int(entry.get("settled_tokens", 0) or 0)
+        return estimate
+
     def reserve_model_call(
         self,
         *,
@@ -894,6 +1641,7 @@ class ArtifactStore:
         # Conservative per-attempt output charge when the provider reports no usage.
         unknown_output_tokens: int = 4000,
         role_cap: Optional[int] = None,
+        execution_id: str = "",
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """Atomically reserve one model call against the run-wide budget.
 
@@ -913,16 +1661,20 @@ class ArtifactStore:
             used_calls = len(settled) + len(open_reservations)
             # Usage rows that did not come from a reservation (legacy/manual rows).
             unreserved = sum((u.input_tokens or 0) + (u.output_tokens or 0) for u in self._meta.usage.values() if not u.attempt_id)
-            reserved_tokens = sum(
-                max(entry.get("settled_tokens", 0), int(entry.get("estimated_input_tokens", 0)) + int(entry.get("estimated_output_tokens", 0)))
-                for entry in self._meta.reservations.values()
-            )
+            reserved_tokens = sum(self._committed_tokens(entry) for entry in self._meta.reservations.values())
             used_tokens = unreserved + reserved_tokens
             # An explicit 0 is a hard cap ("no call may start"), not "unlimited".
             if max_total_model_calls is not None and used_calls >= int(max_total_model_calls):
                 return False, f"model call budget exhausted ({used_calls}/{int(max_total_model_calls)})", None
-            if max_total_tokens is not None and used_tokens >= int(max_total_tokens):
-                return False, f"token budget exhausted ({used_tokens}/{int(max_total_tokens)})", None
+            # The request's own hold must fit too: comparing only what is already
+            # committed let a 400 + 4000 request through at 99500/100000 and overshoot.
+            requested_tokens = max(0, int(estimated_input_tokens or 0)) + max(0, int(unknown_output_tokens or 0))
+            if max_total_tokens is not None:
+                cap_tokens = int(max_total_tokens)
+                if requested_tokens and used_tokens + requested_tokens > cap_tokens:
+                    return False, f"token budget exhausted ({used_tokens} committed + {requested_tokens} requested > {cap_tokens})", None
+                if not requested_tokens and used_tokens >= cap_tokens:
+                    return False, f"token budget exhausted ({used_tokens}/{cap_tokens})", None
             if role_cap is not None:
                 # Role allowance = settled attempts for the role + this role's in-flight
                 # reservations, so a retry cannot slip past a role cap either.
@@ -941,6 +1693,7 @@ class ArtifactStore:
                 "reserved_at": utc_now(),
                 "estimated_input_tokens": int(estimated_input_tokens or 0),
                 "estimated_output_tokens": estimated_output,
+                "execution_id": execution_id,
                 "reserved_model_calls": 1,
                 "settled": False,
             }
@@ -970,13 +1723,40 @@ class ArtifactStore:
         """Return aggregate usage numbers (used by the global budget)."""
         with self._meta.lock:
             usage = list(self._meta.usage.values())
+            costs = [u.cost_usd for u in usage]
+            known_costs = [cost for cost in costs if cost is not None]
+            # A missing price is not a free call. Report the total only when every
+            # attempt has a known cost; otherwise null plus an explicit unknown count.
+            cost_usd = sum(known_costs) if known_costs and len(known_costs) == len(costs) else (0.0 if not costs else None)
+            # Split totals: a recomputable estimate, a lower bound of what is known, and
+            # what the provider actually billed are kept apart, never mixed into one
+            # number that would look authoritative while hiding an unpriced attempt.
+            estimated = sum(known_costs) if known_costs and len(known_costs) == len(costs) else (0.0 if not costs else None)
+            bounded = sum(known_costs) if known_costs else (0.0 if not costs else None)
+            billed_rows = [u.provider_billed_cost_usd for u in usage if u.provider_billed_cost_usd is not None]
+            billed = sum(billed_rows) if billed_rows and len(billed_rows) == len(usage) else None
+            methods: Dict[str, int] = {}
+            for row in usage:
+                methods[row.cost_method or "unknown"] = methods.get(row.cost_method or "unknown", 0) + 1
+            if not usage:
+                completeness = "unknown"
+            elif len(known_costs) == len(costs):
+                completeness = "complete" if all((row.cost_method or "unknown") == "exact_categories" for row in usage) else "partial"
+            else:
+                completeness = "partial"
             return {
                 "model_calls": self._meta.model_calls,
                 "tool_calls": self._meta.tool_calls,
                 "unknown_usage_calls": self._meta.usage_unknown_calls,
+                "cost_unknown_calls": len(costs) - len(known_costs),
                 "input_tokens": sum((u.input_tokens or 0) for u in usage),
                 "output_tokens": sum((u.output_tokens or 0) for u in usage),
-                "cost_usd": sum((u.cost_usd or 0.0) for u in usage),
+                "cost_usd": cost_usd,
+                "estimated_model_cost_usd": estimated,
+                "known_cost_lower_bound_usd": bounded,
+                "provider_billed_cost_usd": billed,
+                "cost_completeness": completeness,
+                "cost_methods": methods,
             }
 
     def calls_by_role(self) -> Dict[str, int]:
@@ -1010,14 +1790,21 @@ class ArtifactStore:
         with self._meta.lock:
             for usage in self._meta.usage.values():
                 role = usage.role or "unknown"
-                row = by_role.setdefault(role, {"calls": 0, "attempts_settled": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "unknown_usage_calls": 0})
+                row = by_role.setdefault(role, {"calls": 0, "attempts_settled": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "cost_known_calls": 0, "cost_unknown_calls": 0, "unknown_usage_calls": 0})
                 row["calls"] += 1
                 row["attempts_settled"] += 1
                 if usage.input_tokens is None and usage.output_tokens is None:
                     row["unknown_usage_calls"] += 1
                 row["input_tokens"] += usage.input_tokens or 0
                 row["output_tokens"] += usage.output_tokens or 0
-                row["cost_usd"] += usage.cost_usd or 0.0
+                if usage.cost_usd is None:
+                    row["cost_unknown_calls"] += 1
+                else:
+                    row["cost_known_calls"] += 1
+                    row["cost_usd"] += usage.cost_usd
+            for row in by_role.values():
+                if row["cost_unknown_calls"]:
+                    row["cost_usd"] = None
             unreserved = sum(1 for entry in self._meta.reservations.values() if not entry.get("settled"))
         summary = {
             "run_id": self.run_id,

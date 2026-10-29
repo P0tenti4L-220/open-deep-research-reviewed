@@ -1,5 +1,7 @@
 Synthesize the user's messages into one concrete research brief. Keep the user's constraints verbatim: language, dates, regions, versions, formats, exclusions. Do not invent details the user did not give; declare them open-ended. Prefer primary sources over aggregators, and write from the user's perspective.
 
+State only what the user asked for. Do not add sub-questions, candidate lists, hypotheses or a research plan: those are derived in later steps and must not become requirements the answer is graded against. Unresolved product identity may be noted as a limitation; do not invent a mandatory disambiguation task the user did not request.
+
 User messages:
 <Messages>
 {messages}

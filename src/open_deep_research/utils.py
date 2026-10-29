@@ -8,11 +8,14 @@ import logging
 import os
 import re
 import warnings
+from urllib.parse import urljoin, urlsplit
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import aiohttp
+import httpx
+from bs4 import BeautifulSoup
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -34,9 +37,12 @@ from langgraph.config import get_store
 from mcp import McpError
 from tavily import AsyncTavilyClient
 
+from open_deep_research import observability as obs
 from open_deep_research.artifacts import ArtifactStore, Identity, ToolResult
-from open_deep_research.configuration import Configuration, SearchAPI
+from open_deep_research.context import clip_preserving_spans
+from open_deep_research.configuration import Configuration, ContextPolicy, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
+from open_deep_research.recovery import request_context, request_context_text
 from open_deep_research.state import ResearchComplete, Summary
 
 ##########################
@@ -81,22 +87,31 @@ async def tavily_search(
             if url not in unique_results:
                 unique_results[url] = {**result, "query": response['query']}
     
-    # Step 3: Set up the summarization model with configuration
-    configurable = Configuration.from_runnable_config(config)
-    
+    # Step 3: resolve ONE call context for the run (config, model, budget, execution).
+    from open_deep_research.context import call_context_for
+
+    call_context = call_context_for(config, role="summarization")
+    configurable = call_context.config
+
     # Character limit to stay within model token limits (configurable)
     max_char_to_include = configurable.max_content_length
-    
-    # Initialize summarization model with retry logic
+
+    # Raw chat model: ``assemble`` binds the response schema and owns the retry, so a
+    # retry is one reserved attempt, not an inner ``with_retry`` plus an outer one.
+    # ``api_key=None`` must not be passed explicitly: it overrides the provider SDK's
+    # own environment lookup (ChatDeepSeek rejects a None key outright).
     model_api_key = get_api_key_for_model(configurable.summarization_model, config)
-    summarization_model = init_chat_model(
-        model=configurable.summarization_model,
-        max_tokens=configurable.summarization_model_max_tokens,
-        api_key=model_api_key,
-        tags=["langsmith:nostream"]
-    ).with_structured_output(Summary).with_retry(
-        stop_after_attempt=configurable.max_structured_output_retries
-    )
+    model_kwargs: Dict[str, Any] = {
+        "model": configurable.summarization_model,
+        "max_tokens": configurable.summarization_model_max_tokens,
+        "tags": ["langsmith:nostream"],
+    }
+    if model_api_key:
+        model_kwargs["api_key"] = model_api_key
+    options = provider_request_options(configurable.summarization_model)
+    if options:
+        model_kwargs["extra_body"] = options
+    summarization_model = init_chat_model(**model_kwargs)
     
     # Step 4: Create summarization tasks (skip empty content)
     async def noop():
@@ -106,8 +121,9 @@ async def tavily_search(
     summarization_tasks = [
         noop() if not result.get("raw_content") 
         else summarize_webpage(
-            summarization_model, 
-            result['raw_content'][:max_char_to_include]
+            summarization_model,
+            result['raw_content'][:max_char_to_include],
+            call_context=call_context,
         )
         for result in unique_results.values()
     ]
@@ -160,7 +176,15 @@ async def tavily_search_async(
     Returns:
         List of search result dictionaries from Tavily API
     """
-    # Initialize the Tavily client with API key from config
+    from open_deep_research.context import call_context_for
+
+    search_context = call_context_for(config or {}, role="search")
+    search_store = search_context.store
+    search_request_id = ""
+    maximum = search_context.config.max_total_search_queries
+    if search_store is not None and maximum is not None:
+        search_request_id = search_store.reserve_search_queries(len(search_queries), maximum, execution_id=search_context.execution_id)
+    # Initialize the Tavily client only after the query budget admits the batch.
     tavily_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
     
     # Create search tasks for parallel execution
@@ -169,52 +193,111 @@ async def tavily_search_async(
             query,
             max_results=max_results,
             include_raw_content=include_raw_content,
-            topic=topic
+            topic=topic,
+            **({"include_domains": search_context.config.search_domains} if search_context.config.search_domains else {}),
         )
         for query in search_queries
     ]
     
     # Execute all search queries in parallel and return results
-    search_results = await asyncio.gather(*search_tasks)
+    search_span = obs.span("search.raw", kind=obs.SPAN_STAGE, attributes={"query_count": len(search_tasks)})
+    try:
+        with search_span:
+            search_results = await asyncio.gather(*search_tasks)
+    except BaseException:
+        if search_request_id:
+            search_store.append_ledger("search_usage", {"request_id": search_request_id, "phase": "finished", "status": "failed_or_cancelled",
+                                                        "provider_credits": None, "provider_billed_cost_usd": None})
+        raise
+    if search_request_id:
+        # Preserve provider usage when returned; absence is unknown, never zero.
+        search_store.append_ledger("search_usage", {"request_id": search_request_id, "phase": "finished", "status": "returned",
+                                                    "provider_usage": [row.get("usage") for row in search_results],
+                                                    "provider_credits": None, "provider_billed_cost_usd": None})
     return search_results
 
-async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
-    """Summarize webpage content using AI model with timeout protection.
-    
+async def summarize_webpage(
+    model: BaseChatModel,
+    webpage_content: str,
+    *,
+    call_context: Any = None,
+    config: RunnableConfig = None,
+    store: Optional[ArtifactStore] = None,
+    identity: Optional[Identity] = None,
+) -> str:
+    """Summarize webpage content through the run ledger, with timeout protection.
+
+    The original one-message prompt and ``Summary`` schema are preserved verbatim: the
+    call is wrapped for accounting, not rewritten by the scoped context builder. The
+    caller passes the *unwrapped* chat model so ``assemble`` owns the single
+    application-level retry (an inner ``with_retry`` would double-count attempts).
+
     Args:
-        model: The chat model configured for summarization
+        model: The chat model configured for summarization (no retry wrapper)
         webpage_content: Raw webpage content to be summarized
-        
+        call_context: The run's resolved configuration/budget/execution (preferred)
+        config: Fallback runnable config used to resolve a call context
+
     Returns:
         Formatted summary with key excerpts, or original content if summarization fails
     """
+    from open_deep_research.context import assemble, auxiliary_packet, call_context_for
+
+    context = call_context or (call_context_for(config, role="summarization", store=store) if config is not None else None)
+    extract_span = obs.span("page.extract", kind=obs.SPAN_STAGE, attributes={"channel": "baseline_summarize", "role": "summarization"})
     try:
-        # Create prompt with current date context
+        # Create prompt with current date context (unchanged baseline prompt)
         prompt_content = summarize_webpage_prompt.format(
-            webpage_content=webpage_content, 
+            webpage_content=webpage_content,
             date=get_today_str()
         )
-        
-        # Execute summarization with timeout to prevent hanging
-        summary = await asyncio.wait_for(
-            model.ainvoke([HumanMessage(content=prompt_content)]),
-            timeout=60.0  # 60 second timeout for summarization
-        )
-        
+        messages = [HumanMessage(content=prompt_content)]
+        with extract_span:
+            if context is not None:
+                packet = auxiliary_packet(
+                    context,
+                    messages,
+                    response_schema=Summary,
+                    max_output_tokens=context.config.summarization_model_max_tokens,
+                    identity=identity,
+                )
+                summary = await asyncio.wait_for(
+                    assemble(
+                        model,
+                        packet,
+                        store=context.store if context.config.artifacts_enabled else None,
+                        record_requests=context.config.record_requests,
+                        max_tokens=context.config.summarization_model_max_tokens,
+                        model_name=context.config.summarization_model,
+                        retries=context.config.max_structured_output_retries,
+                        budget=context.budget,
+                    ),
+                    timeout=60.0,
+                )
+            else:
+                # No run context at all (direct library use): the call cannot be metered.
+                # Say so instead of reporting a smaller total as if it were complete.
+                summary = await asyncio.wait_for(model.ainvoke(messages), timeout=60.0)
+                obs.record_event("auxiliary_usage_unmetered", role="summarization", model=getattr(model, "model_name", "") or "", reason_code="no_run_context")
+        if context is not None and context.store is None:
+            obs.record_event("auxiliary_usage_unmetered", role="summarization", model=context.config.summarization_model, reason_code="no_ledger")
+
         # Format the summary with structured sections
         formatted_summary = (
             f"<summary>\n{summary.summary}\n</summary>\n\n"
             f"<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>"
         )
-        
+
         return formatted_summary
-        
+
     except asyncio.TimeoutError:
         # Timeout during summarization - return original content
+        extract_span.fail(error_class="TimeoutError", status=obs.STATUS_TIMEOUT)
         logging.warning("Summarization timed out after 60 seconds, returning original content")
         return webpage_content
     except Exception as e:
         # Other errors during summarization - log and return original content
+        extract_span.fail(error_class=type(e).__name__)
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
         return webpage_content
 
@@ -589,6 +672,12 @@ async def get_all_tools(config: RunnableConfig):
     search_api = SearchAPI(get_config_value(configurable.search_api))
     search_tools = await get_search_tool(search_api)
     tools.extend(search_tools)
+
+    # Context recovery is bound only in the scoped policy, where the assembler actually
+    # trims material and points at this tool. Binding it in the baseline path would
+    # change the A/C arm under the name of a no-op.
+    if configurable.artifacts_enabled and configurable.context_policy == ContextPolicy.SCOPED:
+        tools.append(request_context)
     
     # Track existing tool names to prevent conflicts
     existing_tool_names = {
@@ -616,6 +705,7 @@ CAPABILITY_MAP: Dict[str, Dict[str, str]] = {
     "research_dispatch": {"ConductResearch": "research_dispatch"},
     "research_done": {"ResearchComplete": "research_done", "ResearchCompleted": "research_done"},
     "self_reflection": {"think_tool": "self_reflection", "ThinkTool": "self_reflection"},
+    "context_recovery": {"request_context": "context_recovery"},
     "web_search": {"web_search": "web_search", "tavily_search": "web_search"},
     "repo_read": {
         "read_file": "repo_read",
@@ -670,6 +760,66 @@ def register_capabilities(name: str, tags: List[str]) -> None:
 def capabilities_for(name: str) -> set:
     """Return capability tags for a tool name (unmapped names get their own tag)."""
     return TOOL_CAPABILITIES.get(name, {name})
+
+
+# Words that indicate which *kind* of source a sub-task needs. The tag decides the
+# tool intersection; it is a deterministic rule, not a semantic classifier, and the
+# default always keeps ordinary web search (dropping it would silently cap research).
+_SOURCE_HINTS: Dict[str, tuple] = {
+    "repo_read": (
+        "repo", "repository", "github", "gitlab", "source code", "codebase", "function",
+        "implementation", "api doc", "sdk", "源码", "代码", "仓库", "函数", "实现", "接口",
+    ),
+    "paper_search": (
+        "paper", "arxiv", "preprint", "journal", "literature", "citation", "study",
+        "论文", "文献", "期刊", "预印本", "研究综述",
+    ),
+    "mcp_read": ("mcp", "model context protocol", "mcp server"),
+}
+
+
+def derive_task_capabilities(topic: str, *, artifacts_enabled: bool = True) -> List[str]:
+    """Return the capability tags one sub-task needs, from its own description.
+
+    Before this rule every task card carried the same five tags, so the intersection
+    filter existed but never actually removed an unrelated source class. The rule is
+    additive on top of web search (the default research source) and only narrows when
+    the task text names a different source class; it never removes self-reflection or
+    the archive read-back path.
+    """
+    lowered = (topic or "").lower()
+    tags: List[str] = ["web_search", "self_reflection", "research_done"]
+    for tag, hints in _SOURCE_HINTS.items():
+        if any(hint in lowered for hint in hints):
+            tags.append(tag)
+    if artifacts_enabled:
+        tags.append("context_recovery")
+    return tags
+
+
+_TASK_WORD_RE = re.compile(r"[A-Za-z0-9_./-]{3,}|[\u4e00-\u9fff]{2,}")
+
+
+def match_task_requirements(topic: str, requirements: List[Any]) -> List[str]:
+    """Return the requirement ids whose statement overlaps this sub-task's topic.
+
+    When nothing matches, every requirement id is returned: refusing to guess is safer
+    than silently dropping a user constraint from a sub-task.
+    """
+    all_ids = [getattr(req, "requirement_id", "") for req in requirements or [] if getattr(req, "requirement_id", "")]
+    topic_terms = {match.lower() for match in _TASK_WORD_RE.findall(topic or "")}
+    if not topic_terms or not all_ids:
+        return all_ids
+    matched: List[str] = []
+    for req in requirements or []:
+        statement = getattr(req, "statement", "") or ""
+        terms = [match.lower() for match in _TASK_WORD_RE.findall(statement)][:12]
+        if not terms:
+            continue
+        overlap = len(topic_terms & set(terms))
+        if overlap >= 1 and (overlap >= 2 or max(len(t) for t in terms) >= 6):
+            matched.append(getattr(req, "requirement_id", ""))
+    return matched or all_ids
 
 
 def select_tools(
@@ -770,6 +920,16 @@ async def execute_tool_call(
         args = {**args, "config": config}
     # The host binds the identity; ``__odr_identity__`` is never a model argument.
     identity = getattr(tool, "_odr_identity", None)
+    if name == "request_context":
+        # Read-back is executed by the host from the bound identity, so the model
+        # cannot pass an agent id, a path or a permission flag.
+        text = request_context_text(
+            need=str(args.get("need") or ""),
+            purpose=str(args.get("purpose") or ""),
+            known_refs=args.get("known_refs") or [],
+            expected_detail=str(args.get("expected_detail") or ""),
+        )
+        return ToolResult(status="ok", content=text)
     if identity is not None and tool_name(tool) == "tavily_search":
         result = await evidence_aware_web_search(
             list(args.get("queries") or []),
@@ -804,6 +964,23 @@ async def execute_tool_call(
 # Evidence-aware extraction
 ##########################
 
+def official_domain_match(url: str, domain: str) -> bool:
+    """Return True only when ``url`` is an https document on ``domain`` (or a subdomain).
+
+    Substring checks accept ``postgresql.org.evil.test`` and
+    ``evil.test/?u=postgresql.org``; neither is the official site. A missing scheme is
+    also rejected: an archived URL must be a real document location.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower().rstrip(".")
+    wanted = str(domain or "").lower().strip(".").rstrip(".")
+    if not parsed.scheme or parsed.scheme.lower() not in {"http", "https"} or not host or not wanted:
+        return False
+    return host == wanted or host.endswith("." + wanted)
+
+
 def select_excerpt(content: str, *, query: str = "", limit: int = 400) -> str:
     """Pick a short, verbatim excerpt from ``content`` for evidence storage."""
     text = (content or "").strip()
@@ -817,6 +994,187 @@ def select_excerpt(content: str, *, query: str = "", limit: int = 400) -> str:
     return text[start : start + limit]
 
 
+_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "was", "were", "are", "is",
+    "what", "when", "which", "how", "does", "did", "official", "please", "about",
+    "into", "than", "then", "there", "their", "have", "has", "had", "not", "但", "的",
+    "了", "和", "是", "在", "有", "与", "及", "或", "对", "为", "以",
+}
+
+
+def _relevance_terms(*texts: str) -> list[str]:
+    """Return content-bearing terms for a task-relevant excerpt window."""
+    terms: list[str] = []
+    for text in texts:
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,}|[\u4e00-\u9fff]{2,}", str(text or "").lower()):
+            token = token.strip(".-_")
+            if len(token) < 3 and not re.match(r"[\u4e00-\u9fff]", token):
+                continue
+            if token in _STOPWORDS or token in terms:
+                continue
+            terms.append(token)
+    return terms[:40]
+
+
+def select_relevant_window(
+    content: str,
+    *,
+    query: str = "",
+    objective: str = "",
+    limit: int = 1200,
+) -> tuple[str, int, int]:
+    """Return the window of ``content`` that best matches the task's own words.
+
+    The old fixed head excerpt showed a page's navigation while the answer lived in
+    the middle. Candidates are verbatim windows anchored on term occurrences; the
+    highest-overlap window wins and ties fall back to the earliest one. Returns
+    ``(text, start, end)`` so the caller can record exact offsets.
+    """
+    text = content or ""
+    if len(text) <= limit:
+        return text, 0, len(text)
+    terms = _relevance_terms(query, objective)
+    if not terms:
+        return text[:limit], 0, limit
+    lowered = text.lower()
+    anchors: list[int] = []
+    for term in terms[:20]:
+        position = lowered.find(term)
+        if position >= 0:
+            anchors.append(position)
+    if not anchors:
+        return text[:limit], 0, limit
+    best = (0, 0, -1)
+    for anchor in anchors[:60]:
+        start = max(0, anchor - limit // 4)
+        newline = text.rfind("\n", max(0, start - 200), start + 200)
+        if newline > 0:
+            start = newline + 1
+        end = min(len(text), start + limit)
+        window = lowered[start:end]
+        score = sum(1 for term in terms if term in window)
+        if score > best[2]:
+            best = (start, end, score)
+    start, end, _ = best
+    return text[start:end], start, end
+
+
+def select_relevant_windows(
+    content: str,
+    *,
+    query: str = "",
+    objective: str = "",
+    limit: int = 1200,
+    max_windows: int = 2,
+) -> list[tuple[int, int]]:
+    """Return up to ``max_windows`` non-overlapping task-relevant ranges.
+
+    A long page can hold two facts that the task needs (a GA date and a supported
+    version, say). One window around the best anchor would hide the other; this picks
+    the best distinct anchors instead. Ranges are verbatim and returned in document
+    order so the caller can record offsets and omitted ranges.
+    """
+    text = content or ""
+    if len(text) <= limit:
+        return [(0, len(text))]
+    terms = _relevance_terms(query, objective)
+    if not terms:
+        return [(0, min(limit, len(text)))]
+    lowered = text.lower()
+    candidates: list[tuple[int, int, int]] = []
+    for term in terms[:20]:
+        start_at = 0
+        for _ in range(3):
+            position = lowered.find(term, start_at)
+            if position < 0:
+                break
+            start_at = position + len(term)
+            start = max(0, position - limit // 3)
+            newline = text.rfind("\n", max(0, start - 200), start + 200)
+            if newline > 0:
+                start = newline + 1
+            end = min(len(text), start + limit)
+            score = sum(1 for candidate_term in terms if candidate_term in lowered[start:end])
+            candidates.append((score, start, end))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    chosen: list[tuple[int, int]] = []
+    for score, start, end in candidates:
+        if score < 1:
+            break
+        overlap = False
+        for other_start, other_end in chosen:
+            shared = min(end, other_end) - max(start, other_start)
+            if shared > 0 and shared > 0.5 * min(end - start, other_end - other_start):
+                overlap = True
+                break
+        if overlap:
+            continue
+        chosen.append((start, end))
+        if len(chosen) >= max_windows:
+            break
+    return sorted(chosen) or [(0, min(limit, len(text)))]
+
+
+def compose_relevant_excerpt(
+    content: str,
+    *,
+    query: str = "",
+    objective: str = "",
+    char_budget: int = 6000,
+    head_chars: int = 800,
+    tail_chars: int = 400,
+) -> tuple[str, list[dict]]:
+    """Compose a bounded extractor view that keeps the task-relevant middle.
+
+    ``clip_preserving_spans`` kept the head and tail, so a date in the body was lost
+    whenever the page was longer than the extractor budget. Here the head and tail are
+    still kept, but the remaining budget is spent on the window that best matches the
+    task/query. Every omitted range is recorded explicitly.
+    """
+    text = content or ""
+    if len(text) <= char_budget:
+        return text, [{"start": 0, "end": len(text)}]
+    head_chars = min(head_chars, max(40, char_budget // 8))
+    tail_chars = min(tail_chars, max(20, char_budget // 12))
+    middle_budget = max(120, char_budget - head_chars - tail_chars - 240)
+    terms = _relevance_terms(query, objective)
+    if not terms:
+        # No task words to rank with: reuse the existing head/tail/exception window so
+        # an unrelated long page still arrives with both ends and its caveats.
+        from open_deep_research.context import clip_preserving_spans
+
+        clipped = clip_preserving_spans(text, char_budget, head_ratio=0.5, tail_ratio=0.25)
+        return clipped.text, [{"start": 0, "end": len(clipped.text), "compressed": True, "omitted_chars": clipped.omitted_chars}]
+    windows = select_relevant_windows(
+        text,
+        query=query,
+        objective=objective,
+        limit=max(120, middle_budget // 2),
+        max_windows=2,
+    )
+    per_window = max(120, middle_budget // max(1, len(windows)))
+    head_end = min(head_chars, len(text))
+    tail_start = max(head_end, len(text) - tail_chars)
+    chunks: list[str] = [text[:head_end]]
+    spans: list[dict] = [{"start": 0, "end": head_end}]
+    cursor = head_end
+    for win_start, win_end in windows:
+        start = max(win_start, head_end)
+        end = min(win_end, tail_start, start + per_window)
+        if end - start < 120:
+            continue
+        if start > cursor:
+            chunks.append(f"\n[... {start - cursor} characters omitted; next task-relevant section follows ...]\n")
+        chunks.append(text[start:end])
+        spans.append({"start": start, "end": end})
+        cursor = max(cursor, end)
+    if tail_start > cursor:
+        chunks.append(f"\n[... {max(0, tail_start - cursor)} characters omitted; trailing exceptions follow ...]\n")
+    chunks.append(text[tail_start:])
+    spans.append({"start": tail_start, "end": len(text)})
+    return "".join(chunks), spans
+
+
 async def summarize_webpage_scoped(
     identity: Identity,
     store: Optional[ArtifactStore],
@@ -825,6 +1183,11 @@ async def summarize_webpage_scoped(
     *,
     url: str = "",
     title: str = "",
+    call_context: Any = None,
+    config: RunnableConfig = None,
+    query: str = "",
+    objective: str = "",
+    source_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Extract from one page with a recorded request and an archive-first guarantee.
 
@@ -832,10 +1195,21 @@ async def summarize_webpage_scoped(
     only a bounded excerpt is returned (never the whole document), so a summarizer
     failure cannot silently flood the researcher's context.
     """
-    from open_deep_research.context import ContextBuilder, assemble
+    from open_deep_research.context import ContextBuilder, assemble, call_context_for
 
-    configurable = Configuration.from_runnable_config({})
-    snippet = select_excerpt(webpage_content, limit=400)
+    if call_context is None:
+        # Legacy/direct callers: resolve from the caller's config. Empty config is a
+        # declared gap, not a silent second default that differs from the run.
+        call_context = call_context_for(config or {}, role="extractor", store=store)
+        if config is None:
+            obs.record_event("auxiliary_context_undeclared", role="extractor", reason_code="no_run_config")
+    configurable = call_context.config
+    # 400 chars stopped at the page's navigation in live runs: the Reviewer saw only
+    # furniture while the claim quoted a line further down, and refused it as
+    # unsupported. The excerpt is what a reviewer can see, so it must reach the body.
+    snippet, excerpt_start, excerpt_end = select_relevant_window(
+        webpage_content, query=query, objective=objective, limit=1200
+    )
     evidence_id = ""
     if store is not None:
         try:
@@ -845,13 +1219,14 @@ async def summarize_webpage_scoped(
                 source_url=url,
                 title=title,
                 excerpt=snippet,
-                origin="webpage_raw_content",
+                locator={"excerpt_start": excerpt_start, "excerpt_end": excerpt_end, "excerpt_query": query or objective, **(source_metadata or {})},
+                origin="direct_https_text" if source_metadata else "webpage_raw_content",
             )
             evidence_id = record.evidence_id
         except Exception:  # noqa: BLE001
             logging.warning("Could not archive webpage before extraction", exc_info=True)
     builder = ContextBuilder(configurable, store)
-    messages, items = builder.extractor_messages(url, title, webpage_content)
+    messages, items = builder.extractor_messages(url, title, webpage_content, query=query, objective=objective)
     packet = builder.build(
         identity,
         "extractor",
@@ -859,29 +1234,153 @@ async def summarize_webpage_scoped(
         items=items,
         model=configurable.summarization_model,
         declared_max_tokens=configurable.summarization_model_max_tokens,
+        response_schema=Summary,
     )
-    pointer = f" [evidence: {evidence_id}]" if evidence_id else ""
-    try:
-        summary = await asyncio.wait_for(
-            assemble(
-                summarization_model,
-                packet,
-                store=store if configurable.artifacts_enabled else None,
-                record_requests=configurable.record_requests,
-                max_tokens=configurable.summarization_model_max_tokens,
-                model_name=configurable.summarization_model,
-            ),
-            timeout=60.0,
+    # Fit the page to the extractor budget before sending. The role rules and the
+    # request scaffolding are charged to the same budget as the page, so a page clipped
+    # to exactly ``budget * 4`` chars still estimated 4.1k-5.4k against a 4k cap and the
+    # request was refused: the caller fell back to a Tavily snippet and the archive
+    # never got a usable excerpt (every live acceptance run hit this). Shrink the page
+    # until the whole request fits, reselecting windows from the original archive
+    # each time so its task-relevant middle and original offsets remain available.
+    view_cap = min(len(webpage_content), max(2000, builder.budget_tokens_for("extractor") * 4))
+    for _ in range(5):
+        if packet.estimated_input_tokens <= packet.budget_tokens:
+            break
+        ratio = packet.estimated_input_tokens / max(1, packet.budget_tokens)
+        target = max(200, int(view_cap / ratio * 0.7))
+        if target >= view_cap:
+            break
+        view_cap = target
+        messages, items = builder.extractor_messages(url, title, webpage_content, query=query, objective=objective, char_budget=view_cap)
+        packet = builder.build(
+            identity,
+            "extractor",
+            messages,
+            items=items,
+            model=configurable.summarization_model,
+            declared_max_tokens=configurable.summarization_model_max_tokens,
+            response_schema=Summary,
         )
+    pointer = f" [evidence: {evidence_id}]" if evidence_id else ""
+    extraction_key = hashlib.sha256(json.dumps({
+        "messages": [message.model_dump(mode="json") for message in packet.messages],
+        "model": configurable.summarization_model, "schema": Summary.model_json_schema(),
+    }, sort_keys=True).encode("utf-8")).hexdigest()
+    if store is not None and evidence_id:
+        cached = store.cached_extraction(identity, evidence_id, extraction_key)
+        if cached is not None:
+            store.append_event({"type": "extraction_reused", "evidence_id": evidence_id, "request_hash": extraction_key})
+            return cached
+    extract_span = obs.span("page.extract", kind=obs.SPAN_STAGE, attributes={"channel": "scoped_extract", "role": "extractor", "model": configurable.summarization_model})
+    try:
+        with extract_span:
+            summary = await asyncio.wait_for(
+                assemble(
+                    summarization_model,
+                    packet,
+                    store=store if configurable.artifacts_enabled else None,
+                    record_requests=configurable.record_requests,
+                    max_tokens=configurable.summarization_model_max_tokens,
+                    model_name=configurable.summarization_model,
+                    retries=configurable.max_structured_output_retries,
+                    budget=call_context.budget,
+                ),
+                timeout=60.0,
+            )
     except asyncio.TimeoutError:
+        extract_span.fail(error_class="TimeoutError", status=obs.STATUS_TIMEOUT)
         logging.warning("Summarization timed out; returning bounded excerpt")
         return f"<summary>\n[extraction timed out] Verbatim excerpt: {snippet}\n</summary>{pointer}"
     except Exception as exc:  # noqa: BLE001
+        extract_span.fail(error_class=type(exc).__name__)
         logging.warning("Summarization failed (%s); returning bounded excerpt", exc)
         return f"<summary>\n[extraction failed: {classify_tool_error(exc)}] Verbatim excerpt: {snippet}\n</summary>{pointer}"
     if summary is None or not getattr(summary, "summary", "").strip():
         return f"<summary>\n[empty extraction] Verbatim excerpt: {snippet}\n</summary>{pointer}"
-    return f"<summary>\n{summary.summary}\n</summary>\n\n<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>{pointer}"
+    result = f"<summary>\n{summary.summary}\n</summary>\n\n<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>{pointer}"
+    if store is not None and evidence_id:
+        store.cache_extraction(evidence_id, extraction_key, result)
+    return result
+
+
+def _has_publication_metadata(text: str) -> bool:
+    cleaned = re.sub(r"[*_`]", "", text or "")
+    return bool(re.search(r"(?:posted on|published (?:on|at)|release date|发布日期|发布于)\s*[:：]?\s*(?:\d{4}[-年/]\d{1,2}|[A-Z][a-z]+\s+\d{1,2})", cleaned, flags=re.IGNORECASE))
+
+
+def _page_fetch_allowed(url: str, config: Configuration) -> bool:
+    try:
+        parts = urlsplit(url)
+        path_allowed = not config.page_fetch_path_prefixes or any(parts.path.startswith(prefix) and parts.path.rstrip("/") != prefix.rstrip("/") for prefix in config.page_fetch_path_prefixes)
+        return parts.scheme.lower() == "https" and not parts.username and not parts.password and parts.port in (None, 443) and path_allowed and any(official_domain_match(url, domain) for domain in config.page_fetch_domains)
+    except ValueError:
+        return False
+
+
+async def fetch_missing_publication_metadata(
+    result: Dict[str, Any], *, identity: Identity, store: Optional[ArtifactStore], config: Configuration,
+) -> Optional[Dict[str, Any]]:
+    """Read one allowed HTTPS page when search omitted its publication header.
+
+    This is opt-in and run-bounded. Redirects stay inside the allowed domains, HTML
+    bytes are archived, and parsed text remains a separate content-hashed snapshot.
+    No model or search-provider request is made by this fallback.
+    """
+    url = str(result.get("url") or "")
+    if store is None or not config.max_total_page_fetches or not _page_fetch_allowed(url, config) or _has_publication_metadata(str(result.get("raw_content") or "")):
+        return None
+    request_id = store.reserve_page_fetch(url, config.max_total_page_fetches)
+    if request_id is None:
+        return None
+    fragment = None
+    if str(result.get("raw_content") or "").strip():
+        fragment = store.add_evidence(identity, content=str(result["raw_content"]), source_url=url,
+                                      title=str(result.get("title") or ""), origin="search_raw_fragment")
+    requests = 0
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+            for _ in range(3):
+                requests += 1
+                async with client.stream("GET", url) as response:
+                    if response.is_redirect:
+                        target = urljoin(url, response.headers.get("location", ""))
+                        if not _page_fetch_allowed(target, config):
+                            raise ValueError("page redirect leaves the allowed HTTPS domains")
+                        url = target
+                        continue
+                    response.raise_for_status()
+                    if "html" not in response.headers.get("content-type", "").lower():
+                        raise ValueError("page is not HTML")
+                    chunks = []
+                    size = 0
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > 500_000:
+                            raise ValueError("page exceeds the 500000-byte bound")
+                        chunks.append(chunk)
+                    html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
+                    break
+            else:
+                raise ValueError("page redirect limit exhausted")
+        soup = BeautifulSoup(html, "html.parser")
+        title_tag = soup.title or soup.find("h1")
+        title = title_tag.get_text(" ", strip=True) if title_tag else ""
+        published = soup.find("meta", attrs={"property": "article:published_time"}) or soup.find("meta", attrs={"itemprop": "datePublished"})
+        date_text = str(published.get("content") or "") if published else ""
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        body = soup.find("main") or soup.find("article") or soup.body or soup
+        text = f"Title: {title}\n" + (f"Published at: {date_text}\n" if date_text else "") + body.get_text("\n", strip=True)
+        raw = store.archive_document(identity, html, url=url, title=title)
+        store.append_ledger("page_fetch_usage", {"request_id": request_id, "phase": "finished", "status": "archived", "http_requests": requests,
+                                               "raw_html_hash": raw["content_hash"], "text_hash": hashlib.sha256(text.encode()).hexdigest()})
+        return {**result, "url": url, "title": title, "raw_content": text,
+                "source_metadata": {"raw_html_hash": raw["content_hash"], "parser": "beautifulsoup-html.parser", "transport": "direct_https",
+                                    "supersedes_evidence_id": fragment.evidence_id if fragment is not None else None}}
+    except Exception as exc:  # noqa: BLE001 - preserve the search fragment on failure
+        store.append_ledger("page_fetch_usage", {"request_id": request_id, "phase": "finished", "status": "failed", "http_requests": requests, "error_class": type(exc).__name__})
+        return None
 
 
 async def evidence_aware_web_search(
@@ -922,15 +1421,38 @@ async def evidence_aware_web_search(
             if url and url not in unique_results:
                 unique_results[url] = {**result, "query": response.get("query", "")}
 
-    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
-    summarization_model = init_chat_model(
-        model=configurable.summarization_model,
-        max_tokens=configurable.summarization_model_max_tokens,
-        api_key=model_api_key,
-        tags=["langsmith:nostream"],
-    ).with_structured_output(Summary).with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+    # Spend the single fetch on a task-relevant publication, not the first homepage
+    # returned by search. Ties prefer the shorter publication URL.
+    terms = _relevance_terms(" ".join(queries), "")
+    candidates = [row for row in unique_results.values() if _page_fetch_allowed(str(row.get("url") or ""), configurable) and not _has_publication_metadata(str(row.get("raw_content") or ""))]
+    if candidates:
+        priority_paths = {path.rstrip("/") for path in configurable.page_fetch_priority_paths}
+        target = max(candidates, key=lambda row: (urlsplit(str(row.get("url") or "")).path.rstrip("/") in priority_paths, sum(term in (str(row.get("title") or "") + " " + str(row.get("url") or "")).lower() for term in terms), -len(str(row.get("url") or ""))))
+        fetched = await fetch_missing_publication_metadata(target, identity=identity, store=store, config=configurable)
+        if fetched is not None:
+            target.update(fetched)
 
-    max_char_to_include = configurable.max_content_length
+    from open_deep_research.context import call_context_for
+
+    extract_context = call_context_for(config, role="extractor", store=store)
+    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    # Pass the raw chat model. ``assemble`` binds the response schema and performs
+    # the bounded retry itself, so every attempt is reserved, counted and priced;
+    # wrapping here would hide provider retries from the run ledger.
+    # ``api_key=None`` is omitted for the same reason as in summarize_webpage: it would
+    # override the provider SDK's environment lookup.
+    summarization_kwargs: Dict[str, Any] = {
+        "model": configurable.summarization_model,
+        "max_tokens": configurable.summarization_model_max_tokens,
+        "tags": ["langsmith:nostream"],
+    }
+    if model_api_key:
+        summarization_kwargs["api_key"] = model_api_key
+    options = provider_request_options(configurable.summarization_model)
+    if options:
+        summarization_kwargs["extra_body"] = options
+    summarization_model = init_chat_model(**summarization_kwargs)
+
     evidence_ids: List[str] = []
     summaries: List[Optional[str]] = []
     for result in unique_results.values():
@@ -942,9 +1464,12 @@ async def evidence_aware_web_search(
             identity,
             store,
             summarization_model,
-            raw[:max_char_to_include],
+            raw,
             url=result.get("url", ""),
             title=result.get("title", ""),
+            call_context=extract_context,
+            query=str(result.get("query") or " ".join(queries)),
+            **({"source_metadata": result["source_metadata"]} if result.get("source_metadata") else {}),
         )
         evidence_ids.extend(re.findall(r"\[evidence: (E\d+)\]", text))
         summaries.append(text)
@@ -1252,6 +1777,22 @@ def get_config_value(value):
     else:
         return value.value
 
+def provider_request_options(model_name: str) -> Dict[str, Any]:
+    """Return the provider request options this deployment must set explicitly.
+
+    DeepSeek enables thinking mode by default. Thinking mode rejects the forced
+    ``tool_choice`` that structured output uses ("Thinking mode does not support this
+    tool_choice", reproduced against ``deepseek-flash``), and its reasoning tokens are
+    billed as output. The documented switch is ``{"thinking": {"type": "disabled"}}``
+    (https://api-docs.deepseek.com/guides/thinking_mode). Other providers get no extra
+    body: an unknown field would be rejected by their API.
+    """
+    provider = str(model_name or "").split(":", 1)[0].strip().lower()
+    if provider == "deepseek":
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
 def get_api_key_for_model(model_name: str, config: RunnableConfig):
     """Get API key for a specific model from environment or config."""
     should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
@@ -1266,6 +1807,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return api_keys.get("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
             return api_keys.get("GOOGLE_API_KEY")
+        elif model_name.startswith("deepseek"):
+            return api_keys.get("DEEPSEEK_API_KEY")
         return None
     else:
         if model_name.startswith("openai:"): 
@@ -1274,6 +1817,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return os.getenv("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
             return os.getenv("GOOGLE_API_KEY")
+        elif model_name.startswith("deepseek"):
+            return os.getenv("DEEPSEEK_API_KEY")
         return None
 
 def get_tavily_api_key(config: RunnableConfig):

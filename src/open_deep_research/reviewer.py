@@ -12,6 +12,10 @@
 - 模型输出只是**未验证的意见**。:func:`validate_decision` 用程序检查 verdict
   枚举、证据 id 是否存在、必填字段和返工上限；任何异常（超时、解析失败、预算
   耗尽、伪造 evidence id）都不得自动变成 ``pass``。
+- 报告正文本身就是引用点：正文出现而账本未归档的 id 进入 ``missing_evidence_ids``，
+  已归档的 id 必须随审查包送到审查者（S1）。
+- 审查是否完成是程序事实：只要有一个必需批次超时、解析失败或用尽预算，即使已有
+  输出也不得完整通过；``review_complete`` 为假时路由不会 ``finalize``（S3）。
 """
 
 from __future__ import annotations
@@ -24,11 +28,15 @@ import re
 from typing import Any, Dict, List, Optional, Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from pydantic import ValidationError
 
+from open_deep_research import observability as obs
 from open_deep_research.artifacts import (
     ArtifactStore,
     Identity,
+    claim_digest,
     hash_obj,
+    utc_now,
 )
 from open_deep_research.configuration import Configuration
 from open_deep_research.state import (
@@ -37,6 +45,7 @@ from open_deep_research.state import (
     ReviewFinding,
     ReviewPacket,
     ReviewStage,
+    RevalidationReceipt,
     Verdict,
 )
 
@@ -78,6 +87,20 @@ REVIEWER_BUDGET_CHARS = 24000  # ~ reviewer_context_budget (8000 tokens) * 3
 REVIEW_MAX_SEGMENTS = 12
 _REVIEW_MIN_SEGMENT_CHARS = 400
 _CITATION_RE = re.compile(r"\[(E[0-9]+)\]")
+
+
+def draft_evidence_ids(draft: str) -> List[str]:
+    """Return the evidence ids the report body itself cites, in first-seen order.
+
+    Both permitted citation forms are read: ``[E1]`` and ``[E1](https://...)``. The
+    link target alone is not a citation, and an id that no claim mentions is still
+    part of the review scope once the writer put it in the draft (S1).
+    """
+    ids: List[str] = []
+    for match in _CITATION_RE.finditer(draft or ""):
+        if match.group(1) not in ids:
+            ids.append(match.group(1))
+    return ids
 
 # Requirement state words the reviewer may use about a requirement in the draft.
 def _segments(text: str, *, budget_chars: int = REVIEWER_BUDGET_CHARS, max_segments: int = REVIEW_MAX_SEGMENTS) -> List[Dict[str, Any]]:
@@ -121,42 +144,104 @@ def _segments(text: str, *, budget_chars: int = REVIEWER_BUDGET_CHARS, max_segme
 
 
 def _draft_blocks(draft: str) -> List[Dict[str, Any]]:
-    """Split a draft into paragraph blocks that keep their heading.
+    """Split a draft into paragraph blocks that keep their heading context.
 
     Blocks are the unit for the "unbound assertion" check: a short factual paragraph
-    written after a cited section must not borrow that section's citations.
+    written after a cited section must not borrow that section's citations. A block
+    that directly follows a Sources/References heading is flagged so that only genuine
+    citation entries inside it can be exempted (see :func:`_is_reference_entry`); the
+    heading itself never exempts a factual sentence.
     """
     blocks: List[Dict[str, Any]] = []
+    in_reference_section = False
     for raw in re.split(r"\n\s*\n", draft or ""):
         block = raw.strip()
-        if block:
-            blocks.append({"index": len(blocks) + 1, "text": block})
+        if not block:
+            continue
+        heading = next((line.strip() for line in block.splitlines() if line.lstrip().startswith("#")), "")
+        if heading:
+            in_reference_section = bool(_REFERENCE_HEADING.match(heading))
+        blocks.append({"index": len(blocks) + 1, "text": block, "reference_section": in_reference_section})
     return blocks
 
 
-_REFERENCE_LINE = re.compile(r"^\s*(\[\d+\]|\d+\.|-|\*)\s+\S")
 _REFERENCE_HEADING = re.compile(r"^#{1,6}\s*(sources?|references?|bibliography|citations?|footnotes?)\b", re.IGNORECASE)
 _URL_ONLY = re.compile(r"^\s*<?https?://\S+>?\s*$")
+_URL_IN_TEXT = re.compile(r"https?://\S+|www\.\S+")
+_LIST_MARKER = re.compile(r"^\s*(?:[-*+]|\d+[.)]|\[\d+\])\s+")
+_BRACKET_ENTRY = re.compile(r"^\s*\[\d+\]")
+_MARKDOWN_LINK = re.compile(r"\[[^\]]*\]\([^)]*\)")
+_SENTENCE_PUNCT = re.compile(r"[.!?。！？](?:\s|$)")
+_YEAR_CITATION = re.compile(r"\b(?:19|20)\d{2}\b")
 
 
-def _is_reference_block(text: str) -> bool:
-    """Return True for a sources/references list: pointers, not factual assertions."""
-    lines = [line for line in (text or "").splitlines() if line.strip()]
-    if not lines:
+def _is_reference_entry(line: str, *, in_reference_section: bool = False) -> bool:
+    """Return True only for a bibliography *pointer* line, not a factual sentence.
+
+    A line is exempt from the assertion check when it is structurally a source
+    pointer: a bare URL, a ``[1]``-prefixed bibliography entry, a list item whose body
+    is a markdown link, or a short label followed by a URL. Inside an explicit
+    Sources/References section a year-bearing citation entry is also accepted (APA
+    style entries carry no URL).
+
+    A bullet or numbered item that states a fact - no link, no URL, no citation
+    marker - is a claim and stays in scope. Merely sitting under a heading (or being
+    the one entry of a list) does not exempt anything (S2).
+    """
+    text = (line or "").strip()
+    if not text or text.startswith("#"):
         return True
-    if len(lines) == 1 and _REFERENCE_HEADING.match(lines[0].strip()):
+    if _URL_ONLY.match(text):
         return True
-    body = [line for line in lines if not line.lstrip().startswith("#")]
+    if _BRACKET_ENTRY.match(text):
+        return True
+    marker = _LIST_MARKER.match(text)
+    body = text[marker.end():].strip() if marker else text
     if not body:
         return True
-    return all(_REFERENCE_LINE.match(line) or _URL_ONLY.match(line) for line in body)
+    if _MARKDOWN_LINK.search(body):
+        remainder = _MARKDOWN_LINK.sub("", body).strip(" \t.,;:)]}>-")
+        if not remainder:
+            return True
+    if not _URL_IN_TEXT.search(body):
+        if marker and in_reference_section and _YEAR_CITATION.search(body):
+            return True
+        return False
+    if not marker:
+        # A prose paragraph that happens to contain a URL is still prose.
+        return False
+    prose = _URL_IN_TEXT.sub("", _MARKDOWN_LINK.sub("", body))
+    prose = prose.strip(" \t.,;:)]}>-")
+    if len(prose) > 160:
+        return False
+    return not bool(_SENTENCE_PUNCT.search(prose + " "))
 
 
-def _assertions(text: str) -> int:
-    """Count sentence-like claims in a draft section (structural, not semantic)."""
-    if _is_reference_block(text):
+def _is_reference_block(text: str, *, in_reference_section: bool = False) -> bool:
+    """Return True when every non-heading line of the block is a source pointer."""
+    lines = [line for line in (text or "").splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if not lines:
+        return True
+    return all(_is_reference_entry(line, in_reference_section=in_reference_section) for line in lines)
+
+
+def _assertions(text: str, *, in_reference_section: bool = False) -> int:
+    """Count sentence-like claims in a draft section (structural, not semantic).
+
+    Reference entries are removed line by line, so a mixed block (one source pointer
+    plus one uncited factual bullet) is still detected. Headings carry no assertion of
+    their own.
+    """
+    kept: List[str] = []
+    for line in (text or "").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if _is_reference_entry(line, in_reference_section=in_reference_section):
+            continue
+        kept.append(line)
+    if not kept:
         return 0
-    sentences = [part for part in re.split(r"(?<=[.!?])\s+|\n+", text or "") if len(part.strip()) >= 25]
+    sentences = [part for part in re.split(r"(?<=[.!?])\s+|\n+", "\n".join(kept)) if len(part.strip()) >= 25]
     return len(sentences)
 
 
@@ -182,7 +267,7 @@ def _unbound_assertions(draft: str, claims: Sequence[Dict[str, Any]]) -> List[Di
     unbound: List[Dict[str, Any]] = []
     for block in _draft_blocks(draft):
         text = block["text"]
-        assertions = _assertions(text)
+        assertions = _assertions(text, in_reference_section=bool(block.get("reference_section")))
         if not assertions:
             continue
         # Headings and bullet labels carry the citations of their body: judge the text.
@@ -190,6 +275,19 @@ def _unbound_assertions(draft: str, claims: Sequence[Dict[str, Any]]) -> List[Di
             continue
         unbound.append({"segment_id": f"P{block['index']}", "assertions": assertions, "excerpt": text[:200]})
     return unbound
+
+
+def _claim_review_material(claim: Dict[str, Any], excerpts: Sequence[Dict[str, Any]]) -> str:
+    """Bind a finding to content; a version-only bump is not a repair."""
+    refs = list(claim.get("evidence_refs") or [])
+    return hash_obj({
+        "statement": claim.get("statement"),
+        "kind": claim.get("kind", "fact"),
+        "evidence_refs": refs,
+        "support_span": claim.get("support_span") or {},
+        "qualifiers": claim.get("qualifiers") or [],
+        "evidence_hashes": {row["evidence_id"]: row.get("content_hash", "") for row in excerpts if row["evidence_id"] in refs},
+    })
 
 
 def build_review_packet(
@@ -225,6 +323,10 @@ def build_review_packet(
     """
     claims = list(claims or [])
     evidence_ids = list(dict.fromkeys(list(evidence_ids or [])))
+    active_ids = {str(claim.get("claim_id")) for claim in claims}
+    prior_findings = [entry for entry in (store.claim_review_findings() if store is not None else []) if entry.get("status") == "open" and entry.get("claim_id") in active_ids]
+    for entry in prior_findings:
+        evidence_ids.extend(eid for eid in entry.get("finding", {}).get("evidence_refs", []) if eid not in evidence_ids)
     counter = list(dict.fromkeys(list(extra_counter_evidence or [])))
     # Every evidence id a claim relies on is in scope, so the reviewer can check the
     # cited source rather than only the supervisor's summary of it.
@@ -235,19 +337,74 @@ def build_review_packet(
     for cid in counter:
         if cid not in evidence_ids:
             evidence_ids.append(cid)
-    excerpts = store.read_evidence_for_review(evidence_ids) if store is not None else []
+    # S1: the report body is itself a citation site. An id the writer put in the draft
+    # is inside the review scope even when no claim references it, so its source must be
+    # shown to the reviewer; an id that was never archived must surface as missing
+    # instead of slipping through as "already cited".
+    for eid in draft_evidence_ids(draft):
+        if eid not in evidence_ids:
+            evidence_ids.append(eid)
+    # Read every id in scope. A fixed default limit turned archived sources into
+    # "missing" once a run had more than 24 of them, which produced false gaps and
+    # blocked correct reports. Truncated excerpts are reported separately: they are
+    # readable, just cut, and must not be counted as absent.
+    focus: Dict[str, str] = {}
+    for claim in claims:
+        span = claim.get("support_span") or {}
+        needle = str(span.get("quote") or claim.get("statement") or "").strip()
+        for ref in claim.get("evidence_refs", []) or []:
+            if needle and ref not in focus:
+                focus[ref] = needle
+    excerpts = store.read_evidence_for_review(evidence_ids, focus=focus) if store is not None else []
+    span_checks: Dict[str, Dict[str, Any]] = {}
+    for claim in claims:
+        span = claim.get("support_span") or {}
+        if not span or store is None:
+            continue
+        try:
+            eid = str(span.get("evidence_id") or "")
+            if eid not in claim.get("evidence_refs", []):
+                raise ValueError("support span is not one of the claim's references")
+            actual = store.bind_quote(eid, str(span.get("quote") or ""))
+            if any(actual.get(key) != span.get(key) for key in ("content_hash", "start", "end", "quote")):
+                raise ValueError("support span does not match the archived offsets/hash")
+            span_checks[str(claim["claim_id"])] = {"support_span_verified": True}
+        except Exception as exc:  # noqa: BLE001 - invalid support cannot become verified
+            span_checks[str(claim["claim_id"])] = {"support_span_verified": False, "support_span_error": str(exc)}
     found = {entry["evidence_id"] for entry in excerpts}
     missing = [eid for eid in evidence_ids if eid not in found]
+    truncated = [entry["evidence_id"] for entry in excerpts if entry.get("excerpt_truncated")]
     open_issues: List[str] = []
     if missing:
         open_issues.append(f"Referenced evidence not archived: {', '.join(missing)}")
+    if truncated:
+        open_issues.append(
+            "These sources are archived but only their opening excerpt is shown here (the full original exists): "
+            + ", ".join(truncated)
+            + ". Do not treat a cut excerpt as missing evidence; qualify any conclusion that needs the omitted part."
+        )
+    revalidation_issues: List[str] = []
+    if store is not None:
+        for event in store.open_revalidations():
+            requirement_ids = ", ".join(event.get("affected_requirement_ids") or [])
+            revalidation_issues.append(
+                f"{event.get('event_id')}: material {', '.join(event.get('restored_refs') or [])} was restored after "
+                f"conclusions for {requirement_ids or 'this task'} were formed; those conclusions need re-checking."
+            )
+        if revalidation_issues:
+            open_issues.extend(revalidation_issues)
     ledger = task_ledger or {}
     coverage_matrix = []
     for requirement in getattr(brief, "requirements", []) or []:
         rid = requirement.requirement_id
-        covering = [c.get("claim_id") for c in claims if rid in (c.get("requirement_ids") or [])]
-        covering_evidence = sorted({r for c in claims if rid in (c.get("requirement_ids") or []) for r in (c.get("evidence_refs") or [])})
+        covering_claims = [c for c in claims if rid in (c.get("requirement_ids") or [])]
+        covering = [c.get("claim_id") for c in covering_claims]
+        covering_evidence = sorted({r for c in covering_claims for r in (c.get("evidence_refs") or [])})
         available = [eid for eid in covering_evidence if eid in found]
+        # A requirement with archived material is only a *candidate*: no review has
+        # semantically verified the claim yet. ``verified`` is reserved for a claim a
+        # previous review accepted, so the first review is not circular.
+        verified = any(str(c.get("support_status") or "") == "supported" for c in covering_claims)
         coverage_matrix.append(
             {
                 "requirement_id": rid,
@@ -256,16 +413,20 @@ def build_review_packet(
                 "claim_ids": covering,
                 "evidence_ids": covering_evidence,
                 "available_evidence_ids": available,
-                "state": "covered" if available else "missing",
+                "state": "verified" if available and verified else ("candidate" if available else "missing"),
             }
         )
     for task_id, entry in ledger.items():
         if entry.get("status") in {"failed", "partial"}:
             open_issues.append(f"Task {task_id} ended {entry.get('status')}: {(entry.get('error') or 'no result')[:200]}")
     claim_ids = [c.get("claim_id") for c in claims if c.get("claim_id")]
+    open_issues.extend(
+        f"Unclosed {entry['finding_id']} for {entry['claim_id']}: {entry['finding']['required_action']}"
+        for entry in prior_findings
+    )
     segments = _segments(draft) if draft else []
     unbound = _unbound_assertions(draft, claims) if draft else []
-    scope_issues: List[str] = []
+    scope_issues: List[str] = [f"{cid}: invalid archived support span: {entry['support_span_error']}" for cid, entry in span_checks.items() if entry.get("support_span_error")]
     if stage == ReviewStage.REPORT:
         if not claims:
             scope_issues.append("report submitted with no claim list: no factual statement in it can be verified")
@@ -288,6 +449,9 @@ def build_review_packet(
         evidence_ids=evidence_ids,
         contradictory_evidence_ids=counter,
         evidence_excerpts=excerpts,
+        evidence_truncated_ids=truncated,
+        revalidation_issues=revalidation_issues,
+        prior_claim_findings=prior_findings,
         claims=[
             {
                 "claim_id": c.get("claim_id"),
@@ -296,6 +460,13 @@ def build_review_packet(
                 "evidence_refs": c.get("evidence_refs", []),
                 "requirement_ids": c.get("requirement_ids", []),
                 "qualifiers": c.get("qualifiers", []),
+                "version": c.get("version", 1),
+                "status": c.get("status", "active"),
+                "support_status": c.get("support_status", "unchecked"),
+                "support_span": c.get("support_span", {}),
+                "unbound_reason": c.get("unbound_reason", ""),
+                "unknown_refs": c.get("unknown_refs", []),
+                **span_checks.get(str(c.get("claim_id")), {}),
             }
             for c in claims
         ],
@@ -308,7 +479,7 @@ def build_review_packet(
         available_evidence_ids=[eid for eid in evidence_ids if eid in found],
         missing_evidence_ids=missing,
         report_segments=segments,
-        draft_assertion_count=sum(_assertions(s.get("text") or "") for s in segments) if draft else 0,
+        draft_assertion_count=sum(_assertions(block["text"], in_reference_section=bool(block.get("reference_section"))) for block in _draft_blocks(draft)) if draft else 0,
         unbound_assertions=unbound,
         scope_issues=scope_issues,
         blocking_issue_count=len(missing) + len([i for i in open_issues if i.startswith("Task ") and " failed" in i]),
@@ -327,6 +498,7 @@ def packet_hash(packet: ReviewPacket) -> str:
     payload = packet.model_dump(mode="json")
     payload.pop("packet_hash", None)
     payload.pop("remaining_budget", None)
+    payload.pop("review_id", None)
     return hash_obj(payload)
 
 
@@ -359,20 +531,47 @@ def render_packet(packet: ReviewPacket) -> str:
         lines.append("</Constraints>")
     if packet.claims:
         lines.append("<Claims>")
+        lines.append("Host checks each claim's own SUPPORT SPAN: location, not semantic entailment; it can fall outside the shared excerpt.")
         for claim in packet.claims:
             lines.append(
-                f"- {claim.get('claim_id')} ({claim.get('kind')}) evidence={claim.get('evidence_refs')} "
-                f"requirements={claim.get('requirement_ids')} qualifiers={claim.get('qualifiers')}: {claim.get('statement')}"
+                f"- {claim.get('claim_id')} ({claim.get('kind')}) v{claim.get('version', 1)} support={claim.get('support_status')} "
+                f"evidence={claim.get('evidence_refs')} requirements={claim.get('requirement_ids')} qualifiers={claim.get('qualifiers')}: {claim.get('statement')}"
             )
+            span = claim.get("support_span") or {}
+            if span.get("quote"):
+                lines.append(
+                    f"  SUPPORT SPAN evidence_id={span.get('evidence_id')} host_verbatim_verified={bool(claim.get('support_span_verified'))} content_hash={span.get('content_hash')} chars {span.get('start')}-{span.get('end')}: {span.get('quote')}"
+                )
+            if claim.get("unbound_reason") or claim.get("unknown_refs"):
+                lines.append(f"  UNBOUND: {claim.get('unbound_reason') or ('unknown ids: ' + ', '.join(claim.get('unknown_refs') or []))}")
         lines.append("</Claims>")
     lines.append("<Evidence>")
     for entry in packet.evidence_excerpts:
         counter = " COUNTER-EVIDENCE" if entry.get("is_counter_evidence") else ""
+        cut = " [excerpt cut to the opening 1200 chars; the full original is archived]" if entry.get("excerpt_truncated") else ""
         lines.append(
-            f"- {entry['evidence_id']}{counter} {entry.get('title', '')} <{entry.get('url', '')}> retrieved {entry.get('retrieved_at', '')}\n"
+            f"- {entry['evidence_id']}{counter} {entry.get('title', '')} <{entry.get('url', '')}> retrieved {entry.get('retrieved_at', '')}{cut}\n"
             f"  EXCERPT: {entry.get('exact_excerpt', '')}"
         )
+        if entry.get("relevant_excerpt"):
+            span = entry.get("relevant_span") or {}
+            lines.append(
+                f"  TASK-RELEVANT WINDOW content_hash={span.get('content_hash')} chars {span.get('start')}-{span.get('end')}"
+                f" (quote present in the archive: {bool(entry.get('relevant_match'))}): {entry['relevant_excerpt']}"
+            )
     lines.append("</Evidence>")
+    lines.append("<PriorClaimFindings>")
+    lines.append(json.dumps([
+        {key: entry[key] for key in ("finding_id", "claim_id", "finding")}
+        for entry in packet.prior_claim_findings
+    ], ensure_ascii=False, indent=2))
+    lines.append("</PriorClaimFindings>")
+    lines.append("finding_resolutions may use only finding_id values in PriorClaimFindings. If the list is empty, return finding_resolutions=[]. Revalidation and OpenIssues ids are not claim finding ids.")
+    if packet.revalidation_issues:
+        lines.append("<Revalidation>")
+        lines.append("Newly recovered material may invalidate conclusions formed before it was available:")
+        lines.extend(f"- {issue}" for issue in packet.revalidation_issues)
+        lines.append("</Revalidation>")
     if packet.open_issues:
         lines.append("<OpenIssues>")
         lines.extend(f"- {issue}" for issue in packet.open_issues)
@@ -397,6 +596,11 @@ def render_packet(packet: ReviewPacket) -> str:
     lines.append(f"<Budget>{json.dumps(packet.remaining_budget, ensure_ascii=False)}</Budget>")
     lines.append("</ReviewPacket>")
     return "\n".join(lines)
+
+
+def _split_union(value: Any) -> List[str]:
+    """Split a field that a model may fill with several ids (``"C1, C2"``)."""
+    return [part for part in re.split(r"[,;，；\s]+", str(value or "").strip()) if part]
 
 
 def validate_decision(
@@ -431,7 +635,7 @@ def validate_decision(
     requirement_states = {str(item.get("requirement_id")): str(item.get("state") or "missing") for item in packet.coverage_matrix or []}
     mandatory_requirement_ids = [str(item.get("requirement_id")) for item in packet.coverage_matrix or [] if item.get("mandatory")]
 
-    def base(verdict: Verdict, status: str, err: str = "", note: str = "") -> ReviewDecision:
+    def base(verdict: Verdict, status: str, err: str = "", note: str = "", protocol_errors: Optional[List[str]] = None) -> ReviewDecision:
         findings = [
             ReviewFinding(
                 issue_type="other",
@@ -455,7 +659,9 @@ def validate_decision(
             review_status=status,
             review_cost=review_cost,
             review_model_calls=review_model_calls,
-            error="; ".join(part for part in (err, note) if part),
+            review_complete=False,
+            protocol_errors=list(protocol_errors or []),
+            error="; ".join(part for part in ("reviewer protocol error: " + "; ".join(protocol_errors) if protocol_errors else "", err, note) if part),
         )
 
     if raw is None:
@@ -464,48 +670,127 @@ def validate_decision(
     available_evidence = set(packet.available_evidence_ids or packet.evidence_ids)
     claimed_evidence = set(packet.evidence_ids)
     allowed_claims = set(packet.claim_ids)
+    allowed_sections = set(all_segments) | {str(row["segment_id"]) for row in packet.unbound_assertions}
     findings: List[ReviewFinding] = []
     violations: List[str] = []
+    protocol_errors: List[str] = []
+    field_notes: List[str] = []
     for finding in raw.findings or []:
-        refs = list(finding.evidence_refs or [])
+        # P/S ids are supplied by the host. A known paragraph in the claim field is
+        # a segment finding, never an invented claim or evidence gap.
+        if finding.claim_id in allowed_sections and not finding.segment_id:
+            finding = finding.model_copy(update={"claim_id": "", "segment_id": finding.claim_id})
+        section_tokens = _split_union(finding.segment_id)
+        if any(token not in allowed_sections for token in section_tokens):
+            violations.append(f"finding cites unknown segment id {finding.segment_id!r}")
+            protocol_errors.append("finding.segment_id is outside the packet's shown sections")
+        claim_tokens = _split_union(finding.claim_id)
+        valid_union = len(claim_tokens) > 1 and all(token in allowed_claims for token in claim_tokens)
+        if len(claim_tokens) > 1 and not valid_union:
+            protocol_errors.append(f"finding.claim_id mixes ids {claim_tokens!r}; not all are valid claims")
+        refs = []
+        for ref in finding.evidence_refs or []:
+            tokens = _split_union(ref)
+            if len(tokens) > 1 and any(token not in claimed_evidence for token in tokens):
+                protocol_errors.append(f"finding.evidence_refs mixes ids {tokens!r}; not all are in scope")
+            refs.extend(tokens)
+        refs = list(dict.fromkeys(refs))
         bogus = [ref for ref in refs if ref not in claimed_evidence]
-        if bogus:
-            violations.append(f"finding cites non-existent evidence ids: {bogus}")
-            refs = [ref for ref in refs if ref in claimed_evidence]
-        if finding.claim_id and finding.claim_id not in allowed_claims:
+        # A claim id in evidence_refs names no source: it is stripped, never accepted
+        # as evidence. It is reported as a field error rather than a fabricated source,
+        # because the finding's target is still named in claim_id and a reviewer format
+        # slip must not by itself veto an otherwise verified delivery. Unknown tokens
+        # (invented E/C ids) stay violations.
+        misplaced = [ref for ref in bogus if ref in allowed_claims or ref.startswith("C-")]
+        fabricated = [ref for ref in bogus if ref not in misplaced]
+        refs = [ref for ref in refs if ref in claimed_evidence]
+        if misplaced:
+            field_notes.append(
+                f"finding.evidence_refs holds claim ids {misplaced}: claim ids belong in claim_id, evidence_refs take archived E ids"
+            )
+        if fabricated:
+            violations.append(f"finding cites non-existent evidence ids: {fabricated}")
+        if finding.claim_id and finding.claim_id not in allowed_claims and not valid_union:
             violations.append(f"finding cites unknown claim id {finding.claim_id!r}")
         issue_type = finding.issue_type if finding.issue_type in ISSUE_TYPES else "other"
-        findings.append(finding.model_copy(update={"evidence_refs": refs, "issue_type": issue_type}))
+        for cid in dict.fromkeys(claim_tokens if valid_union else [finding.claim_id]):
+            for sid in dict.fromkeys(section_tokens or [""]):
+                findings.append(finding.model_copy(update={"claim_id": cid, "segment_id": sid, "evidence_refs": refs, "issue_type": issue_type}))
 
-    checked = [cid for cid in dict.fromkeys(raw.checked_claim_ids or []) if cid in allowed_claims]
-    unknown_checked = [cid for cid in (raw.checked_claim_ids or []) if cid not in allowed_claims]
+    raw_checked: List[str] = []
+    for entry in raw.checked_claim_ids or []:
+        tokens = _split_union(entry)
+        if len(tokens) > 1 and not all(token in allowed_claims for token in tokens):
+            protocol_errors.append(f"checked_claim_ids mixes ids {tokens!r}; not all are valid claims")
+        raw_checked.extend(tokens)
+    checked = [cid for cid in dict.fromkeys(raw_checked) if cid in allowed_claims]
+    unknown_checked = [cid for cid in raw_checked if cid not in allowed_claims]
     if unknown_checked:
         violations.append(f"reviewer claims to have checked unknown ids: {unknown_checked}")
     unchecked = [cid for cid in packet.claim_ids if cid not in checked]
 
-    checked_requirements = [rid for rid in dict.fromkeys(raw.checked_requirement_ids or []) if str(rid) in requirement_states]
-    unknown_requirements = [rid for rid in (raw.checked_requirement_ids or []) if str(rid) not in requirement_states]
+    def split_checked(values: Sequence[str], allowed: Sequence[str], field: str) -> List[str]:
+        tokens: List[str] = []
+        for value in values:
+            parts = _split_union(value)
+            if len(parts) > 1 and any(part not in allowed for part in parts):
+                protocol_errors.append(f"{field} mixes ids {parts!r}; not all are in scope")
+            tokens.extend(parts)
+        return list(dict.fromkeys(tokens))
+
+    requirement_tokens = split_checked(raw.checked_requirement_ids or [], list(requirement_states), "checked_requirement_ids")
+    checked_requirements = [rid for rid in requirement_tokens if rid in requirement_states]
+    unknown_requirements = [rid for rid in requirement_tokens if rid not in requirement_states]
     if unknown_requirements:
         violations.append(f"reviewer claims to have verified unknown requirement ids: {unknown_requirements}")
+    acknowledged_tokens = split_checked(raw.acknowledged_unknown_requirement_ids or [], list(requirement_states), "acknowledged_unknown_requirement_ids")
     acknowledged = [
         rid
-        for rid in dict.fromkeys(raw.acknowledged_unknown_requirement_ids or [])
-        if str(rid) in requirement_states and requirement_states.get(str(rid)) != "covered"
+        for rid in acknowledged_tokens
+        if str(rid) in requirement_states and requirement_states.get(str(rid)) not in {"verified", "covered"}
     ]
-    unknown_acknowledged = [rid for rid in (raw.acknowledged_unknown_requirement_ids or []) if str(rid) not in requirement_states]
+    unknown_acknowledged = [rid for rid in acknowledged_tokens if str(rid) not in requirement_states]
     if unknown_acknowledged:
         violations.append(f"reviewer acknowledges unknown requirement ids: {unknown_acknowledged}")
-    uncovered_requirements = [
-        rid for rid in mandatory_requirement_ids if requirement_states.get(rid) != "covered" and rid not in acknowledged
-    ]
+    # ``candidate`` coverage means material exists but nobody has checked it in this
+    # review: it counts only when the reviewer explicitly checked that requirement.
+    uncovered_requirements = []
+    for rid in mandatory_requirement_ids:
+        if rid in acknowledged:
+            continue
+        state = requirement_states.get(rid)
+        if state in {"verified", "covered"}:
+            continue
+        if state == "candidate" and rid in checked_requirements:
+            continue
+        uncovered_requirements.append(rid)
 
-    checked_segments = [sid for sid in dict.fromkeys(raw.checked_segment_ids or []) if sid in all_segments]
-    unknown_segments = [sid for sid in (raw.checked_segment_ids or []) if sid not in all_segments]
+    segment_tokens = split_checked(raw.checked_segment_ids or [], all_segments, "checked_segment_ids")
+    checked_segments = [sid for sid in segment_tokens if sid in all_segments]
+    unknown_segments = [sid for sid in segment_tokens if sid not in all_segments]
     if unknown_segments:
         violations.append(f"reviewer claims to have checked unknown segment ids: {unknown_segments}")
     unreviewed_segments = [sid for sid in all_segments if sid not in checked_segments]
 
-    blocking_findings = [f for f in findings if f.severity == "blocking"]
+    # A later omission cannot erase a previously rejected, unchanged claim.
+    by_id = {str(claim.get("claim_id")): claim for claim in packet.claims}
+    prior_by_id = {entry["finding_id"]: entry for entry in packet.prior_claim_findings}
+    resolutions: Dict[str, str] = {}
+    for resolution in raw.finding_resolutions:
+        finding_id, reason = resolution.finding_id, resolution.reason
+        prior = prior_by_id.get(finding_id)
+        if prior is None or len(reason.strip()) < 12 or prior.get("claim_id") not in checked or not set(prior.get("finding", {}).get("evidence_refs", [])).issubset(available_evidence) or (all_segments and unreviewed_segments):
+            protocol_errors.append(f"invalid or unreviewed finding resolution {finding_id!r}")
+            violations.append(f"finding resolution {finding_id!r} lacks scoped recheck evidence")
+        else:
+            resolutions[finding_id] = "; ".join(dict.fromkeys([resolutions[finding_id], reason.strip()])) if finding_id in resolutions else reason.strip()
+    for prior in packet.prior_claim_findings:
+        cid = str(prior["claim_id"])
+        claim = by_id.get(cid)
+        if claim is not None and prior["finding_id"] not in resolutions and _claim_review_material(claim, packet.evidence_excerpts) == prior.get("material_hash"):
+            if not any(f.claim_id == cid and f.severity in {"major", "blocking"} for f in findings):
+                findings.append(ReviewFinding(**prior["finding"]))
+    blocking_findings = [f for f in findings if f.severity in {"blocking", "major"}]
     notes: List[str] = []
     if packet.missing_evidence_ids:
         notes.append(f"claims cite evidence that was never archived: {packet.missing_evidence_ids}")
@@ -516,7 +801,7 @@ def validate_decision(
 
     verdict = Verdict(raw.verdict)
     status = "passed"
-    error_parts = list(violations) + notes
+    error_parts = [f"reviewer protocol error: {item}" for item in protocol_errors] + list(violations) + list(field_notes) + notes
     report_stage = packet.stage == ReviewStage.REPORT
     if verdict == Verdict.PASS:
         if violations:
@@ -529,12 +814,13 @@ def validate_decision(
         elif blocking_findings:
             verdict = Verdict.REVISE
             status = "changes_requested"
-            error_parts.append("pass with blocking findings is inconsistent; treated as revise")
+            error_parts.append("pass with unresolved major/blocking findings is inconsistent; treated as revise")
         elif report_stage and (packet.missing_evidence_ids or packet.scope_issues or packet.unbound_assertions or blocking_findings):
             # R1: a report whose sources do not exist, whose claims were never built,
             # or whose sections cite nothing cannot be delivered as fully verified.
-            verdict = Verdict.INSUFFICIENT_EVIDENCE
-            status = "inconclusive"
+            citation_only = bool(packet.claim_ids and packet.unbound_assertions) and not packet.missing_evidence_ids and all("draft section(s) assert facts without citing" in issue for issue in packet.scope_issues)
+            verdict = Verdict.REVISE if citation_only else Verdict.INSUFFICIENT_EVIDENCE
+            status = "changes_requested" if citation_only else "inconclusive"
             error_parts.append("pass requires verifiable delivery: missing evidence, unbound assertions or unmet scope preconditions")
             for issue in packet.scope_issues:
                 findings.append(
@@ -551,6 +837,7 @@ def validate_decision(
             for item in packet.unbound_assertions:
                 findings.append(
                     ReviewFinding(
+                        segment_id=str(item["segment_id"]),
                         issue_type="unsupported_claim",
                         severity="major",
                         explanation=f"{item['segment_id']} asserts facts without citing a claim or evidence id: {item.get('excerpt', '')[:120]}",
@@ -582,6 +869,27 @@ def validate_decision(
         for finding in findings:
             if not finding.required_action.strip():
                 finding.required_action = "Provide a specific, checkable required action."
+
+    # S3: "the review finished" is a program fact, independent of the model's verdict.
+    # A required batch that timed out, failed to parse or ran out of budget leaves part
+    # of the draft unread; the records of the batches that did run are kept, but they
+    # can never authorize a full delivery. This also covers the case where earlier
+    # batches already produced a complete-looking ``pass``.
+    review_complete = not error
+    if error:
+        if verdict == Verdict.PASS:
+            verdict = Verdict.INSUFFICIENT_EVIDENCE
+        if verdict != Verdict.REVISE:
+            status = "unreviewed"
+        findings.append(
+            ReviewFinding(
+                issue_type="other",
+                severity="blocking",
+                explanation=f"the review did not finish: {error}",
+                required_action="Re-run the review once the failure clears, or deliver only the reviewed part and state the unreviewed scope.",
+            )
+        )
+        error_parts.insert(0, f"review incomplete: {error}")
     return ReviewDecision(
         review_id=packet.review_id,
         stage=packet.stage,
@@ -598,8 +906,51 @@ def validate_decision(
         review_status=status,
         review_cost=review_cost,
         review_model_calls=review_model_calls,
+        review_complete=review_complete,
+        protocol_errors=list(protocol_errors),
+        finding_resolutions=resolutions,
         error="; ".join(error_parts),
     )
+
+
+def _record_claim_review_findings(store: ArtifactStore, packet: ReviewPacket, decision: ReviewDecision) -> None:
+    """Close a finding only after changed material was independently rechecked."""
+    claims = {str(claim.get("claim_id")): claim for claim in packet.claims}
+    existing = store.claim_review_findings()
+    current_findings = [f for f in decision.findings if f.severity in {"major", "blocking"}]
+    can_close = decision.review_complete and not decision.protocol_errors
+    for prior in existing:
+        if prior.get("status") != "open":
+            continue
+        cid = str(prior["claim_id"])
+        latest = store.get_claim(cid)
+        withdrawn = latest is not None and latest.get("status") == "withdrawn"
+        claim = claims.get(cid)
+        rechecked = (
+            can_close and claim is not None and cid in decision.checked_claim_ids
+            and not any(f.claim_id == cid for f in current_findings)
+            and (_claim_review_material(claim, packet.evidence_excerpts) != prior.get("material_hash") or prior["finding_id"] in decision.finding_resolutions)
+        )
+        if withdrawn or rechecked:
+            store.append_ledger("claim_review_findings", {
+                "finding_id": prior["finding_id"], "status": "resolved", "resolved_by": decision.review_id,
+                "resolution": "claim withdrawn" if withdrawn else decision.finding_resolutions.get(prior["finding_id"], "changed claim/source material independently rechecked"),
+                "packet_hash": decision.packet_hash,
+            })
+    for finding in current_findings:
+        claim = claims.get(finding.claim_id)
+        if claim is None:
+            continue
+        material_hash = _claim_review_material(claim, packet.evidence_excerpts)
+        payload = finding.model_dump(mode="json")
+        finding_id = "finding-" + hash_obj([finding.claim_id, material_hash, payload])[:16]
+        if any(entry["finding_id"] == finding_id and entry.get("status") == "open" for entry in existing):
+            continue
+        store.append_ledger("claim_review_findings", {
+            "finding_id": finding_id, "status": "open", "review_id": decision.review_id,
+            "claim_id": finding.claim_id, "material_hash": material_hash, "finding": payload,
+            "draft_hash": packet.draft_hash,
+        })
 
 
 def decision_summary(decision: ReviewDecision) -> str:
@@ -613,7 +964,7 @@ def decision_summary(decision: ReviewDecision) -> str:
     if decision.findings:
         lines.append("Required actions:")
         for finding in decision.findings:
-            target = finding.claim_id or finding.requirement_id or "general"
+            target = finding.claim_id or finding.segment_id or finding.requirement_id or "general"
             lines.append(f"- [{finding.severity}] {target} ({finding.issue_type}): {finding.explanation} -> {finding.required_action}")
     if decision.unresolved_conflicts:
         lines.append(f"Unresolved conflicts: {', '.join(decision.unresolved_conflicts)}")
@@ -622,39 +973,32 @@ def decision_summary(decision: ReviewDecision) -> str:
     return "\n".join(lines)
 
 
-def trim_packet_for_budget(packet: ReviewPacket, excess_tokens: int) -> ReviewPacket:
-    """Shrink excerpts to fit the reviewer budget, recording what was cut.
+def _split_text_half(text: str) -> tuple:
+    """Cut text into two contiguous halves, preferring a newline near the middle."""
+    if len(text) < 2:
+        return text, ""
+    middle = len(text) // 2
+    low = max(1, middle - 200)
+    high = min(len(text) - 1, middle + 200)
+    newline = text.rfind("\n", low, high) if high > low else -1
+    cut = newline + 1 if newline > 0 else middle
+    cut = min(max(1, cut), len(text) - 1)
+    return text[:cut], text[cut:]
 
-    Evidence excerpts may be shortened (the reviewer still sees the id, URL and the
-    head of the source). The draft is different: a pass needs the *whole* draft, so a
-    draft segment that no longer fits is removed **and listed by id** as unreviewed.
-    A decision built from a trimmed packet can therefore never report full coverage.
+
+def _restrict_checked_segments(out: RawReviewOutput, requested: Sequence[str]) -> RawReviewOutput:
+    """Keep only the segment ids the request actually showed (S3, rule 4).
+
+    A batch can only have read what it was sent. Claiming a segment id that this
+    request did not contain is dropped, so a self-reported "checked everything" cannot
+    cover a batch that never ran.
     """
-    payload = packet.model_dump(mode="json")
-    budget_chars = max(1200, max(800, 4000 - max(0, excess_tokens)) * 4)
-    per_item = max(200, budget_chars // max(1, len(payload.get("evidence_excerpts") or [])))
-    payload["evidence_excerpts"] = [
-        {**entry, "exact_excerpt": (entry.get("exact_excerpt") or "")[:per_item]} for entry in payload.get("evidence_excerpts") or []
-    ]
-    remaining = budget_chars
-    kept: List[Dict[str, Any]] = []
-    dropped: List[str] = []
-    for segment in payload.get("report_segments") or []:
-        text = segment.get("text") or ""
-        if kept and len(text) > remaining:
-            # Dropping is recorded, never silent: the id goes to ``unreviewed`` below.
-            dropped.append(str(segment.get("segment_id")))
-            continue
-        kept.append(segment)
-        remaining = max(0, remaining - len(text))
-    payload["report_segments"] = kept
-    payload["report_sections"] = [{"title": seg.get("segment_id"), "segment_id": seg.get("segment_id"), "text": seg.get("text")} for seg in kept]
-    payload["proposed_action"] = (payload.get("proposed_action") or "")[:2000]
-    payload["open_issues"] = list(payload.get("open_issues") or []) + [
-        "Some evidence excerpts were shortened to fit the reviewer budget.",
-        *([f"Draft segment(s) {', '.join(dropped)} exceed the reviewer budget and are NOT reviewed."] if dropped else []),
-    ]
-    return ReviewPacket(**payload)
+    allowed = set(requested)
+    claimed = list(dict.fromkeys(out.checked_segment_ids or []))
+    kept = [sid for sid in claimed if sid in allowed]
+    if len(kept) == len(claimed):
+        return out
+    return out.model_copy(update={"checked_segment_ids": kept})
 
 
 async def run_review(
@@ -667,22 +1011,37 @@ async def run_review(
     model_name: str,
     cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> ReviewDecision:
-    """Run one review in a fresh request and validate the result.
+    """Run one review in fresh request(s) and validate the result.
 
     Reviews are replayed from ``cache`` when the packet hash is unchanged: the same
-    packet cannot be charged twice. When the whole packet does not fit the reviewer's
-    request budget it is reviewed in contiguous batches of draft segments; the merged
-    decision reports exactly the segments, claims and requirements that were covered,
-    so a partial review can never authorize a full delivery.
+    packet cannot be charged twice.
+
+    Under ``context_policy=scoped`` the draft is packed into contiguous units that fit
+    one request. Packing measures *the request that will be sent* (same messages, tools
+    and response schema), never an average per-batch guess:
+
+    * a segment larger than one request is split into contiguous character ranges
+      (``S1.1``, ``S1.2`` ...); no character is dropped, and a parent segment counts as
+      reviewed only when every sub-range was read;
+    * if the fixed part of the request (role rules, claims, evidence, requirement
+      matrix) already exceeds the budget, or the smallest reviewable piece cannot fit,
+      no request is sent and the decision records the unreviewed scope (S6);
+    * any batch failure (timeout, parse failure, budget stop) vetoes a full pass even
+      when earlier batches produced output, and a batch may only claim the segment ids
+      that request actually showed (S3);
+    * once a batch returns ``stop`` the remaining batches are not started (S4).
     """
     from open_deep_research.context import BudgetExhausted, ContextBuilder, ModelCallBudget, assemble, role_rules
     from open_deep_research.utils import get_today_str
 
-    if cache is not None and packet.packet_hash in cache:
-        cached = cache[packet.packet_hash]
-        return ReviewDecision(**cached)
     if store is not None:
         store.write_review_artifact(packet.review_id, "packet", packet)
+    if cache is not None and packet.packet_hash in cache:
+        decision = ReviewDecision(**cache[packet.packet_hash]).model_copy(update={"review_id": packet.review_id, "review_model_calls": 0, "review_cost": 0.0})
+        if store is not None:
+            store.write_review_artifact(packet.review_id, "decision", decision)
+            store.append_event({"type": "review_reused", "review_id": packet.review_id, "packet_hash": packet.packet_hash})
+        return decision
     rules = role_rules("reviewer", date=get_today_str())
     builder = ContextBuilder(config, store)
     # The reviewer has its own call allowance (per attempt, including retries) on top
@@ -690,6 +1049,19 @@ async def run_review(
     reviewer_budget = ModelCallBudget(store, config)
     role_cap = max(0, int(getattr(config, "max_review_model_calls", 0) or 0)) or None
     scoped = str(getattr(config.context_policy, "value", config.context_policy)) == "scoped"
+
+    original_segments = [dict(segment) for segment in (packet.report_segments or [])]
+    parent_order = [str(segment.get("segment_id")) for segment in original_segments]
+    units: List[Dict[str, Any]] = [
+        {
+            "segment_id": sid,
+            "text": segment.get("text") or "",
+            "char_start": int(segment.get("char_start") or 0),
+            "char_end": int(segment.get("char_end") or 0),
+            "parent": sid,
+        }
+        for segment, sid in zip(original_segments, parent_order)
+    ]
 
     def build_messages(candidate: ReviewPacket) -> List[BaseMessage]:
         return [SystemMessage(content=rules), HumanMessage(content=render_packet(candidate))]
@@ -711,81 +1083,294 @@ async def run_review(
             declared_max_tokens=config.reviewer_model_max_tokens,
         )
 
-    # Split the packet into contiguous draft batches that each fit one request.
-    batches: List[List[str]] = [[str(seg.get("segment_id")) for seg in (packet.report_segments or [])]]
-    segments_by_id = {str(seg.get("segment_id")): seg for seg in (packet.report_segments or [])}
-    packet_ctx = measure(packet)
-    if scoped and packet_ctx.estimated_input_tokens > packet_ctx.budget_tokens and len(batches[0]) > 1:
-        probes = [measure(packet.model_copy(update={"review_segments": [sid]})) for sid in (segments_by_id[s] for s in batches[0])]
-        segment_cost = int(sum(max(1, p.estimated_input_tokens) for p in probes) / len(probes))
-        base_cost = int(max(0, packet_ctx.estimated_input_tokens - segment_cost * len(batches[0])))
-        per_batch = max(1, (packet_ctx.budget_tokens - base_cost) // max(1, segment_cost))
-        batches = [batches[0][i : i + per_batch] for i in range(0, len(batches[0]), per_batch)]
-        packet_ctx = measure(packet)
-    elif scoped and packet_ctx.estimated_input_tokens > packet_ctx.budget_tokens:
-        packet_ctx = measure(trim_packet_for_budget(packet, packet_ctx.estimated_input_tokens - packet_ctx.budget_tokens))
+    def candidate_for(segment_pool: Sequence[Dict[str, Any]], selected: Sequence[str]) -> ReviewPacket:
+        """A packet copy that shows exactly ``selected`` out of ``segment_pool``."""
+        candidate = packet.model_copy(
+            update={
+                "report_segments": [dict(segment) for segment in segment_pool],
+                "report_sections": [
+                    {"title": segment["segment_id"], "segment_id": segment["segment_id"], "text": segment.get("text") or ""}
+                    for segment in segment_pool
+                ],
+                "review_segments": list(selected),
+            }
+        )
+        candidate.packet_hash = packet.packet_hash
+        return candidate
+
+    def finish(decision: ReviewDecision, *, execution_error: str, batches: int) -> ReviewDecision:
+        if store is not None:
+            _record_claim_review_findings(store, packet, decision)
+            store.write_review_artifact(packet.review_id, "decision", decision)
+            store.append_event(
+                {
+                    "type": "review",
+                    "review_id": packet.review_id,
+                    "stage": packet.stage.value,
+                    "verdict": decision.verdict.value,
+                    "status": decision.review_status,
+                    "error": decision.error,
+                    "batches": batches,
+                    "calls": decision.review_model_calls,
+                    "complete": decision.review_complete,
+                }
+            )
+        if cache is not None and not execution_error:
+            cache[packet.packet_hash] = decision.model_dump(mode="json")
+        obs.record_event(
+            "review_decision",
+            review_id=packet.review_id,
+            review_stage=packet.stage.value,
+            verdict=str(getattr(decision.verdict, "value", decision.verdict)),
+            complete=bool(decision.review_complete),
+            checked_count=len(getattr(decision, "checked_claim_ids", []) or []),
+            unchecked_count=len(getattr(decision, "unchecked_requirement_ids", []) or []),
+            batch_count=batches,
+        )
+        return decision
+
+    def refuse(reason: str) -> ReviewDecision:
+        """Return "not reviewed" without sending anything (the budget cannot fit it)."""
+        if store is not None:
+            store.append_event({"type": "review_not_sent", "review_id": packet.review_id, "reason": reason})
+        return finish(validate_decision(None, packet, error=reason, review_model_calls=0), execution_error=reason, batches=0)
+
+    unchanged = [
+        entry for entry in packet.prior_claim_findings
+        if not (packet.draft_hash and entry.get("draft_hash") and packet.draft_hash != entry["draft_hash"])
+        if any(str(claim.get("claim_id")) == entry["claim_id"] and _claim_review_material(claim, packet.evidence_excerpts) == entry["material_hash"] for claim in packet.claims)
+    ]
+    if unchanged:
+        # No new paid opinion can close an unchanged rejected claim. Return the
+        # existing required actions with no claimed checks and no provider call.
+        raw = RawReviewOutput(verdict="revise", summary="Previously rejected claim/source material is unchanged.", findings=[ReviewFinding(**entry["finding"]) for entry in unchanged])
+        return finish(validate_decision(raw, packet, review_model_calls=0), execution_error="", batches=0)
+
+    batches: List[List[str]] = []
+    budget = 0
+    if not units:
+        # Non-report stages and empty drafts carry no draft segments: one request.
+        batches = [[]]
+    elif not scoped:
+        batches = [[unit["segment_id"] for unit in units]]
+    else:
+        fixed = measure(candidate_for([], []))
+        budget = fixed.budget_tokens
+        if fixed.estimated_input_tokens > budget:
+            return refuse(
+                f"reviewer context budget {budget} cannot fit the fixed part of the review request "
+                f"({fixed.estimated_input_tokens} estimated input tokens); no request was sent"
+            )
+        # Split any segment that cannot fit one request on its own, keeping contiguous
+        # character ranges so the text can be reassembled exactly.
+        while True:
+            oversized = next(
+                (
+                    unit
+                    for unit in units
+                    if measure(candidate_for(units, [unit["segment_id"]])).estimated_input_tokens > budget
+                ),
+                None,
+            )
+            if oversized is None:
+                break
+            if len(oversized["text"]) <= _REVIEW_MIN_SEGMENT_CHARS:
+                return refuse(
+                    f"review segment {oversized['segment_id']} cannot fit the reviewer context budget {budget} "
+                    f"({len(oversized['text'])} characters); no request was sent"
+                )
+            left, right = _split_text_half(oversized["text"])
+            offset = oversized["char_start"]
+            replacements: List[Dict[str, Any]] = []
+            for part_index, part in enumerate((left, right), start=1):
+                replacements.append(
+                    {
+                        "segment_id": f"{oversized['segment_id']}.{part_index}",
+                        "text": part,
+                        "char_start": offset,
+                        "char_end": offset + len(part),
+                        "parent": oversized["parent"],
+                    }
+                )
+                offset += len(part)
+            index = units.index(oversized)
+            units[index : index + 1] = replacements
+        # Greedy packing, in draft order, over measured candidates.
+        current: List[Dict[str, Any]] = []
+        for unit in units:
+            trial = current + [unit]
+            if current and measure(candidate_for(units, [item["segment_id"] for item in trial])).estimated_input_tokens > budget:
+                batches.append([item["segment_id"] for item in current])
+                current = [unit]
+            else:
+                current = trial
+        if current:
+            batches.append([item["segment_id"] for item in current])
+
+    segments_by_parent: Dict[str, List[str]] = {}
+    for unit in units:
+        segments_by_parent.setdefault(unit["parent"], []).append(unit["segment_id"])
 
     raw_outputs: List[RawReviewOutput] = []
-    error = ""
+    execution_error = ""
     calls = 0
     for index, batch in enumerate(batches, start=1):
-        candidate = packet.model_copy(update={"review_segments": batch}) if batch else packet
-        candidate.packet_hash = packet.packet_hash
+        candidate = candidate_for(units, batch)
         ctx = measure(candidate)
-        if scoped and ctx.estimated_input_tokens > ctx.budget_tokens and store is not None:
-            store.append_event({"type": "review_batch_over_budget", "review_id": packet.review_id, "batch": index, "batches": len(batches), "segment_ids": batch})
+        if ctx.estimated_input_tokens > ctx.budget_tokens:
+            if store is not None:
+                store.append_event(
+                    {
+                        "type": "review_batch_over_budget",
+                        "review_id": packet.review_id,
+                        "batch": index,
+                        "batches": len(batches),
+                        "segment_ids": batch,
+                        "estimated_input_tokens": ctx.estimated_input_tokens,
+                        "budget_tokens": ctx.budget_tokens,
+                        "counting_method": ctx.manifest.counting_method if ctx.manifest is not None else "",
+                    }
+                )
+            if scoped:
+                execution_error = (
+                    f"review batch {index} of {len(batches)} was not sent: {ctx.estimated_input_tokens} estimated "
+                    f"input tokens exceed the reviewer context budget {ctx.budget_tokens}"
+                )
+                break
+        batch_span = obs.span(
+            "review.batch",
+            kind=obs.SPAN_REVIEW,
+            attributes={
+                "review_id": packet.review_id,
+                "review_stage": packet.stage.value,
+                "batch_index": index,
+                "batch_count": len(batches),
+                "role": "reviewer",
+                "agent_instance_id": reviewer_identity.agent_instance_id,
+            },
+        )
         try:
-            calls += 1
-            out = await asyncio.wait_for(
-                assemble(
-                    model,
-                    ctx,
-                    store=store,
-                    record_requests=config.record_requests,
-                    max_tokens=config.reviewer_model_max_tokens,
-                    model_name=model_name,
-                    retries=config.max_structured_output_retries,
-                    budget=reviewer_budget,
-                    role_cap=role_cap,
-                ),
-                timeout=config.review_timeout_seconds,
-            )
-            if isinstance(out, dict):
-                out = RawReviewOutput(**out)
-            elif not isinstance(out, RawReviewOutput):
-                out = RawReviewOutput.model_validate(json.loads(str(getattr(out, "content", "")) or "{}"))
-            raw_outputs.append(out)
+            # A reviewer answer that does not satisfy the decision schema is a bad
+            # response, not a negative verdict: retry it once (each attempt is ledgered)
+            # instead of turning an empty object into "insufficient evidence" and
+            # finalizing a partial run on a parsing accident (seen in the F-D run).
+            for attempt_index in range(2):
+                calls += 1
+                with batch_span:
+                    out = await asyncio.wait_for(
+                        assemble(
+                            model,
+                            ctx,
+                            store=store,
+                            record_requests=config.record_requests,
+                            max_tokens=config.reviewer_model_max_tokens,
+                            model_name=model_name,
+                            retries=config.max_structured_output_retries,
+                            budget=reviewer_budget,
+                            role_cap=role_cap,
+                        ),
+                        timeout=config.review_timeout_seconds,
+                    )
+                    batch_span.set(verdict=str(getattr(getattr(out, "verdict", None), "value", "") or ""), checked_count=len(getattr(out, "checked_segment_ids", []) or []))
+                try:
+                    if isinstance(out, dict):
+                        out = RawReviewOutput(**out)
+                    elif not isinstance(out, RawReviewOutput):
+                        out = RawReviewOutput.model_validate(json.loads(str(getattr(out, "content", "")) or "{}"))
+                    break
+                except (ValidationError, json.JSONDecodeError) as exc:
+                    if store is not None:
+                        store.append_event(
+                            {
+                                "type": "review_output_invalid",
+                                "review_id": packet.review_id,
+                                "batch": index,
+                                "attempt": attempt_index + 1,
+                                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                            }
+                        )
+                    if attempt_index:
+                        raise
         except asyncio.TimeoutError:
-            error = f"review timed out (batch {index} of {len(batches)})"
+            batch_span.fail(error_class="TimeoutError", status=obs.STATUS_TIMEOUT)
+            execution_error = f"review timed out (batch {index} of {len(batches)})"
             break
         except BudgetExhausted as exc:
             # A refused allowance is a budget stop, not a provider failure: record it
             # as such (the attempts that did run are already in the ledger).
-            error = f"review stopped by the budget: {exc.reason} (batch {index} of {len(batches)})"
+            batch_span.fail(error_class=type(exc).__name__, status=obs.STATUS_BUDGET_DENIED)
+            execution_error = f"review stopped by the budget: {exc.reason} (batch {index} of {len(batches)})"
             break
         except Exception as exc:  # noqa: BLE001 - any failure must not become a pass
-            error = f"review failed: {type(exc).__name__}: {str(exc)[:200]}"
+            batch_span.fail(error_class=type(exc).__name__)
+            execution_error = f"review failed: {type(exc).__name__}: {str(exc)[:200]}"
             break
         except asyncio.CancelledError:
-            # The caller stopped us (e.g. a timeout around the whole review): the
-            # attempt is counted and the cancellation is propagated untouched.
+            # The caller stopped us: the attempt is counted and the cancellation is
+            # propagated untouched.
             raise
-    merged = merge_review_outputs(raw_outputs) if raw_outputs else None
-    decision = validate_decision(merged, packet, error=error, review_model_calls=calls)
-    if store is not None:
-        store.write_review_artifact(packet.review_id, "decision", decision)
-        store.append_event({"type": "review", "review_id": packet.review_id, "stage": packet.stage.value, "verdict": decision.verdict.value, "status": decision.review_status, "error": decision.error, "batches": len(batches), "calls": calls})
-    if cache is not None and not error:
-        cache[packet.packet_hash] = decision.model_dump(mode="json")
-    return decision
+        claimed = list(dict.fromkeys(out.checked_segment_ids or []))
+        out = _restrict_checked_segments(out, batch)
+        if len(out.checked_segment_ids or []) != len(claimed) and store is not None:
+            store.append_event(
+                {
+                    "type": "review_ignored_unrequested_segments",
+                    "review_id": packet.review_id,
+                    "batch": index,
+                    "claimed_not_shown": [sid for sid in claimed if sid not in set(batch)],
+                }
+            )
+        raw_outputs.append(out)
+        if out.verdict == Verdict.STOP and index < len(batches):
+            # A stop is a decision to end the run: do not spend further review calls on
+            # batches that can no longer change the outcome (S4).
+            if store is not None:
+                store.append_event(
+                    {
+                        "type": "review_stopped_early",
+                        "review_id": packet.review_id,
+                        "batch": index,
+                        "skipped_batches": len(batches) - index,
+                        "skipped_segment_ids": [sid for rest in batches[index:] for sid in rest],
+                    }
+                )
+            break
+
+    # Map reviewed units back to the packet's own segment ids. Coverage is judged over
+    # the whole review (a split segment counts only when every contiguous sub-range was
+    # read in some batch), while an id no request ever showed stays unknown and is
+    # reported by ``validate_decision``.
+    unit_ids = {unit["segment_id"] for unit in units}
+    claimed_units = {sid for out in raw_outputs for sid in (out.checked_segment_ids or [])}
+    covered = [
+        parent
+        for parent in parent_order
+        if segments_by_parent.get(parent) and all(sid in claimed_units for sid in segments_by_parent[parent])
+    ]
+    extras = [sid for sid in claimed_units if sid not in unit_ids and sid not in covered]
+    translated = [out.model_copy(update={"checked_segment_ids": []}) for out in raw_outputs]
+    merged = merge_review_outputs(translated) if translated else None
+    if merged is not None:
+        merged = merged.model_copy(update={"checked_segment_ids": covered + extras})
+    decision = validate_decision(merged, packet, error=execution_error, review_model_calls=calls)
+    return finish(decision, execution_error=execution_error, batches=len(batches))
+
+
+_VERDICT_PRIORITY = {"stop": 4, "insufficient_evidence": 3, "revise": 2, "pass": 1}
 
 
 def merge_review_outputs(outputs: Sequence[RawReviewOutput]) -> RawReviewOutput:
-    """Merge the per-batch reviewer opinions into one (pessimistic) combined opinion.
+    """Merge per-batch opinions into one pessimistic, order-independent opinion.
 
-    The merged verdict is a candidate the program still validates: claims / segments /
-    requirements are the union of what the reviewer says it checked, findings are
-    concatenated. The verdict is ``pass`` only when every batch passed.
+    The merged verdict keeps the strongest signal any batch produced, using the
+    explicit priority ``stop > insufficient_evidence > revise > pass`` (S4). A ``stop``
+    is a request to end the run, so it is never downgraded into "keep revising"; the
+    batches' summaries, findings and scope records are all kept, which keeps the stop
+    reason and the unreviewed range visible.
+
+    Checked claims / segments / requirements are the union of what the batches say they
+    checked (the program still filters them), and explicit-unknown requirement ids are
+    merged the same way instead of being dropped (S5).
     """
     if len(outputs) == 1:
         return outputs[0]
@@ -798,10 +1383,7 @@ def merge_review_outputs(outputs: Sequence[RawReviewOutput]) -> RawReviewOutput:
                     seen.append(value)
         return seen
 
-    verdicts = [out.verdict for out in outputs]
-    verdict = verdicts[0] if all(v == verdicts[0] for v in verdicts) else "revise"
-    if "insufficient_evidence" in verdicts and verdict != "pass":
-        verdict = "insufficient_evidence"
+    verdict = max((out.verdict for out in outputs), key=lambda value: _VERDICT_PRIORITY.get(value, 0))
     return RawReviewOutput(
         verdict=verdict,
         summary=" | ".join(out.summary for out in outputs if out.summary),
@@ -809,8 +1391,80 @@ def merge_review_outputs(outputs: Sequence[RawReviewOutput]) -> RawReviewOutput:
         checked_claim_ids=union("checked_claim_ids"),
         checked_requirement_ids=union("checked_requirement_ids"),
         checked_segment_ids=union("checked_segment_ids"),
+        acknowledged_unknown_requirement_ids=union("acknowledged_unknown_requirement_ids"),
         unresolved_conflicts=union("unresolved_conflicts"),
+        finding_resolutions=[entry for out in outputs for entry in out.finding_resolutions],
     )
+
+
+def issue_revalidation_receipts(
+    *,
+    store: Optional[ArtifactStore],
+    decision: ReviewDecision,
+    packet: ReviewPacket,
+    checker_identity: str,
+    report_version: int = 0,
+) -> List[Dict[str, Any]]:
+    """Issue receipts for correction events this review actually re-checked.
+
+    Recovery opens an event; only an independent check can close it. The reviewer's
+    ``checked_claim_ids`` is the evidence that a claim was read, and this function turns
+    that into a receipt bound to the packet, the claim hashes and the evidence hashes.
+    An unchecked claim, an incomplete review or a contradicted claim is recorded as
+    such; none of them is silently upgraded to "verified".
+    """
+    if store is None or not decision.review_complete or not decision.packet_hash:
+        return []
+    claims = {str(claim.get("claim_id")): claim for claim in store.active_claims()}
+    findings: Dict[str, List[ReviewFinding]] = {}
+    for finding in decision.findings:
+        if finding.claim_id:
+            findings.setdefault(finding.claim_id, []).append(finding)
+    issued: List[Dict[str, Any]] = []
+    for event in store.open_revalidations():
+        affected = {str(rid) for rid in (event.get("affected_requirement_ids") or [])}
+        if not affected:
+            continue
+        task_id = str(event.get("task_id") or "")
+        relevant = [
+            claim
+            for claim in claims.values()
+            if affected.intersection(str(rid) for rid in (claim.get("requirement_ids") or []))
+            and (not task_id or str(claim.get("_owner_task") or "") == task_id)
+        ]
+        if not relevant:
+            continue
+        verdicts: Dict[str, str] = {}
+        for claim in relevant:
+            cid = str(claim.get("claim_id"))
+            if cid not in set(decision.checked_claim_ids):
+                verdicts[cid] = "insufficient_evidence"
+                continue
+            blocking = [f for f in findings.get(cid, []) if f.severity in {"blocking", "major"}]
+            verdicts[cid] = "verified_contradicted" if blocking else "verified_supported"
+        evidence_ids = sorted({ref for claim in relevant for ref in (claim.get("evidence_refs") or [])})
+        snapshot = store.evidence_snapshot(evidence_ids)
+        receipt = RevalidationReceipt(
+            receipt_id=f"receipt-{decision.review_id}-{event.get('event_id')}",
+            event_id=str(event.get("event_id")),
+            review_id=decision.review_id,
+            packet_hash=decision.packet_hash,
+            task_id=task_id,
+            claim_ids=sorted(verdicts),
+            claim_hashes={cid: claim_digest(claim) for cid, claim in claims.items() if cid in verdicts},
+            claim_versions={cid: int(claims[cid].get("version", 1) or 1) for cid in verdicts},
+            requirement_ids=sorted(affected),
+            evidence_ids=[item["evidence_id"] for item in snapshot],
+            evidence_hashes={item["evidence_id"]: item["content_hash"] for item in snapshot},
+            evidence_versions={item["evidence_id"]: item["document_version"] for item in snapshot},
+            verdicts=verdicts,
+            report_version=report_version,
+            checker_identity=checker_identity,
+            checker_kind="independent_reviewer",
+            created_at=utc_now(),
+        )
+        issued.append(store.record_revalidation_receipt(receipt))
+    return issued
 
 
 def apply_review(
@@ -826,7 +1480,8 @@ def apply_review(
 
     Returns one of ``continue_research | rewrite_report | finalize | finalize_partial``.
 
-    A stale review (draft changed after review) can never authorize ``finalize``.
+    A stale review (draft changed after review) or an unfinished review (a batch that
+    timed out, failed to parse or ran out of budget) can never authorize ``finalize``.
     At the report stage the verdict distinguishes the remedies:
 
     * ``revise`` -> rewrite the report;
@@ -840,6 +1495,18 @@ def apply_review(
     budget_open = bool(remaining_budget.get("open", True))
     iterations_left = int(remaining_budget.get("iterations_left", 0) or 0)
     revisions_left = revision_rounds < max_revision_rounds
+
+    if decision.protocol_errors:
+        # A malformed reviewer answer is not evidence that research is missing. Do
+        # not spend a research/repair turn on it, and never let it authorize delivery.
+        return "finalize_partial"
+
+    if not decision.review_complete:
+        # S3: an unfinished review cannot authorize a delivery, even when the partial
+        # verdict said ``pass``.
+        if stage == ReviewStage.REPORT:
+            return "rewrite_report" if budget_open and revisions_left else "finalize_partial"
+        return "continue_research" if budget_open and revisions_left else "finalize_partial"
 
     if decision.draft_hash and current_hash and decision.draft_hash != current_hash:
         # The reviewed text is no longer the text that would be delivered.

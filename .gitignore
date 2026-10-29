@@ -1,78 +1,88 @@
+# Public repository: explicitly allow top-level runtime and documentation files.
+# Local tests, benchmarks, reports, private notes and new project folders stay local.
+/*
+!/.gitignore
+!/.env.example
+!/.github/
+!/LICENSE
+!/README.md
+!/langgraph.json
+!/pyproject.toml
+!/uv.lock
+!/src/
+!/docs/
 
-*.egg-info
-*.pyc
+/src/*
+!/src/open_deep_research/
+!/src/legacy/
+!/src/security/
+/docs/*
+!/docs/public/
 
-# Python
+# Local assistant instructions and settings.
+AGENTS.md
+CLAUDE.md
+.agents/
+.codex/
+.claude/
+
+# Credentials and local configuration; the blank example is intentional.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# Tests, notebooks, generated research content and experiment data.
+tests/
+benchmarks/
+.benchmarks/
+files/
+experiments/
+results/
+reports/
+*.ipynb
+.ipynb_checkpoints/
+.odr_runs/
+*.odr_runs/
+.runs/
+
+# Python / build / virtual environments.
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
-
-# Virtual environments
+.eggs/
+build/
+dist/
 venv/
+.venv/
 env/
 ENV/
-.env
 
-# IDE specific files
+# Caches, logs and temporary files.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+*.log
+logs/
+tmp/
+temp/
+.langgraph/
+.langgraph_api/
+node_modules/
 .idea/
 .vscode/
 *.swp
 *.swo
 .DS_Store
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Testing
-.coverage
-htmlcov/
-.pytest_cache/
-.tox/
-
-# Logs
-*.log
-logs/
-
-# Local development
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# Dependencies
-node_modules/
-
-# LangGraph specific
-.langgraph/
-
-# Temporary files
-tmp/
-temp/
-
-.langgraph_api
-
-# Open Deep Research run artifacts (evidence originals, requests, metrics).
-# They may contain user input, search content and request records: never publish them.
-.odr_runs/
-*.odr_runs/
-.runs/
-
-# Virtual environment used locally (kept as a project-level rule on purpose)
-.venv/

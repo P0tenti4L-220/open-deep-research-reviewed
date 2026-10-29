@@ -11,6 +11,8 @@ Reduce duplication without losing information: every relevant fact, condition, q
 4. Keep the source URL next to every statement it supports, and keep the evidence ids when they are available.
 5. Add a short "Gaps" list for questions the task asked but the sources did not answer.
 6. Never describe a tool that failed as if it had returned results.
+7. facts[] contains atomic answer facts supported in full by their own source quote. Keep transcript self-assessments about tools, source permissions, whether a model read a whole page, and research plans in summary/gaps; do not turn them into answer claims merely because the same sentence mentions the topic.
+8. Each fact must directly address this task. Bibliographic metadata and unrelated feature lists stay provenance/background unless the task asks about them. Split a statement when one quote does not support every clause, and avoid producing paraphrased duplicates.
 </Rules>
 
 <Output format>
